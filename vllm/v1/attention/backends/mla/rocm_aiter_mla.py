@@ -268,7 +268,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             fast_mode=True,
             dtype_q=self._metadata_q_dtype,
             dtype_kv=self._metadata_kv_dtype,
-            max_split_per_batch=16,
+            max_split_per_batch=64,
         )
 
         attn_metadata = AiterMLADecodeMetadata(
