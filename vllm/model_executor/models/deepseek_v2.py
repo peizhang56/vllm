@@ -239,10 +239,12 @@ class DeepseekV2MoE(nn.Module):
         parallel_config: ParallelConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
+        self.reduce_results = reduce_results
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
@@ -390,7 +392,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
+        elif self.reduce_results and self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states
             )
@@ -428,6 +430,7 @@ class DeepseekV2Attention(nn.Module):
         v_head_dim: int,
         q_lora_rank: int,
         kv_lora_rank: int,
+        reduce_results: bool = True,
         max_position_embeddings: int = 8192,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -499,6 +502,7 @@ class DeepseekV2Attention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
         if config.rope_parameters["rope_type"] != "default":
@@ -843,6 +847,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -912,6 +917,7 @@ class DeepseekV2MLAAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -1041,6 +1047,26 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self.use_mha = use_mha
 
+        # Defer the TP all-reduce after o_proj / MoE / dense MLP and fold it
+        # into the next RMSNorm via `RMSNorm(fused_allreduce=True)`. The
+        # ROCm+aiter `CudaCommunicator.fused_allreduce_rmsnorm` raises if it
+        # is invoked without the right prerequisites, so this gate must
+        # match exactly: aiter enabled (implies ROCm), aiter's fused kernel
+        # has templates only for TP world_size in {2, 4, 8}, sequence-
+        # parallel MoE replaces AR with all-gather so there is nothing to
+        # fuse, and non-MLA variants don't go through the deferred-AR path.
+        self.fuse_ar_rmsnorm = (
+            rocm_aiter_ops.is_fused_allreduce_rmsnorm_enabled()
+            and get_tensor_model_parallel_world_size() in (2, 4, 8)
+            and not use_mha
+            and not parallel_config.use_sequence_parallel_moe
+        )
+
+        # When fusion is active, the upstream o_proj / MLP / MoE must skip
+        # their own all-reduce so the fused RMSNorm can perform it.
+        attn_reduce_results = not self.fuse_ar_rmsnorm
+        mlp_reduce_results = not self.fuse_ar_rmsnorm
+
         if use_mha:
             attn_cls = DeepseekAttention
         elif model_config.use_mla:
@@ -1062,6 +1088,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            reduce_results=attn_reduce_results,
         )
 
         if (
@@ -1074,6 +1101,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=mlp_reduce_results,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -1081,11 +1109,23 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=mlp_reduce_results,
                 prefix=f"{prefix}.mlp",
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Layer 0's input_layernorm runs on the embedding output and gets
+        # `residual=None` on its first call, so there is nothing to fuse the
+        # all-reduce *into* there. (PP intermediate ranks always receive a
+        # non-None residual via `IntermediateTensors`, so absolute layer_idx
+        # is the right gate even when `start_layer != 0`.)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=self.fuse_ar_rmsnorm and layer_idx > 0,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=self.fuse_ar_rmsnorm,
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
@@ -1180,9 +1220,23 @@ class DeepseekV2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        # The final norm has to fold the all-reduce in iff the last decoder
+        # layer's MLP/MoE was built with `reduce_results=False`, i.e. it
+        # set `fuse_ar_rmsnorm=True`.
+        fused_allreduce_final_norm = (
+            get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+            and getattr(
+                self.layers[self.end_layer - 1], "fuse_ar_rmsnorm", False
+            )
+        )
 
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_allreduce=fused_allreduce_final_norm,
+            )
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
