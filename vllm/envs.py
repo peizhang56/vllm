@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
+    VLLM_ROCM_AITER_FUSED_MLA_DECODE: bool = False
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
@@ -1008,6 +1009,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_FP4BMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FP4BMM", "True").lower() in ("true", "1")
+    ),
+    # Whether to fuse the MLA decode-side RoPE + KV-cache write + Q FP8 quant
+    # into aiter's `fuse_qk_rope_concat_and_cache_mla_per_head_kernel`. When
+    # enabled, the model wrapper skips its rotary_emb call, the base
+    # `concat_and_cache_mla` is skipped, and `_DecodeConcatQuantFP8` is
+    # replaced by a single fused launch (matches ATOM's decode kernel
+    # sequence). Currently only honored by the AITER MLA backends. By default
+    # is disabled.
+    "VLLM_ROCM_AITER_FUSED_MLA_DECODE": lambda: (
+        os.getenv("VLLM_ROCM_AITER_FUSED_MLA_DECODE", "False").lower()
+        in ("true", "1")
     ),
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (

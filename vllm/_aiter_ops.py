@@ -464,6 +464,70 @@ def _rocm_aiter_mla_decode_fwd_fake(
     pass
 
 
+def _rocm_aiter_fused_qk_rope_concat_and_cache_mla_decode_impl(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    q_scale: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    is_neox: bool,
+    is_nope_first: bool,
+) -> None:
+    """Fused decode-side rope + concat + KV-cache write for MLA.
+
+    Wraps `aiter.fused_qk_rope_concat_and_cache_mla` so it can be registered as
+    a vLLM custom op (torch.compile / cudagraph friendly).
+
+    Mutates: ``q_out`` and ``kv_cache`` in place. ``q_nope``/``q_pe``/``kv_c_normed``/
+    ``k_pe`` are read-only inputs (the rotary embedding is applied on the fly into
+    ``q_out``/``kv_cache``).
+    """
+    import aiter as rocm_aiter
+
+    rocm_aiter.fused_qk_rope_concat_and_cache_mla(
+        q_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache,
+        q_out,
+        slot_mapping,
+        k_scale,
+        q_scale,
+        positions,
+        cos_cache,
+        sin_cache,
+        is_neox=is_neox,
+        is_nope_first=is_nope_first,
+    )
+
+
+def _rocm_aiter_fused_qk_rope_concat_and_cache_mla_decode_fake(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    q_scale: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    is_neox: bool,
+    is_nope_first: bool,
+) -> None:
+    return
+
+
 def _rocm_aiter_gemm_a8w8_impl(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1064,6 +1128,7 @@ class rocm_aiter_ops:
     # TODO: Consolidate under _LINEAR_ENABLED
     _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
     _FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
+    _FUSED_MLA_DECODE_ENABLED = envs.VLLM_ROCM_AITER_FUSED_MLA_DECODE
     # TODO: Consolidate under _LINEAR_ENABLED
     _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
@@ -1231,6 +1296,19 @@ class rocm_aiter_ops:
 
     @classmethod
     @if_aiter_supported
+    def is_fused_mla_decode_enabled(cls) -> bool:
+        # Gate for `fuse_qk_rope_concat_and_cache_mla_per_head_kernel`.
+        # Requires the standard MLA aiter path to be active so that the
+        # downstream `mla_a8w8_qh16_qseqlen1_gqaratio16_ps` kernel is the
+        # one consuming the fused q_out tensor.
+        return (
+            cls._AITER_ENABLED
+            and cls._MLA_ENABLED
+            and cls._FUSED_MLA_DECODE_ENABLED
+        )
+
+    @classmethod
+    @if_aiter_supported
     def is_asm_fp4_gemm_dynamic_quant_enabled(cls) -> bool:
         from vllm.platforms.rocm import on_gfx950
 
@@ -1313,6 +1391,17 @@ class rocm_aiter_ops:
                 op_func=_rocm_aiter_mla_decode_fwd_impl,
                 mutates_args=["o"],
                 fake_impl=_rocm_aiter_mla_decode_fwd_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_qk_rope_concat_and_cache_mla_decode",
+                op_func=(
+                    _rocm_aiter_fused_qk_rope_concat_and_cache_mla_decode_impl
+                ),
+                mutates_args=["q_out", "kv_cache"],
+                fake_impl=(
+                    _rocm_aiter_fused_qk_rope_concat_and_cache_mla_decode_fake
+                ),
             )
 
             direct_register_custom_op(
@@ -1730,6 +1819,40 @@ class rocm_aiter_ops:
         )
 
     @staticmethod
+    def fused_qk_rope_concat_and_cache_mla_decode(
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        q_out: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_scale: torch.Tensor,
+        q_scale: torch.Tensor,
+        positions: torch.Tensor,
+        cos_cache: torch.Tensor,
+        sin_cache: torch.Tensor,
+        is_neox: bool,
+        is_nope_first: bool = True,
+    ) -> None:
+        torch.ops.vllm.rocm_aiter_fused_qk_rope_concat_and_cache_mla_decode(
+            q_nope,
+            q_pe,
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            q_out,
+            slot_mapping,
+            k_scale,
+            q_scale,
+            positions,
+            cos_cache,
+            sin_cache,
+            is_neox,
+            is_nope_first,
+        )
+
+    @staticmethod
     def per_tensor_quant(
         x: torch.Tensor,
         quant_dtype: torch.dtype,
@@ -1841,6 +1964,57 @@ class rocm_aiter_ops:
             transpose_bm=transpose_bm,
             prequant=prequant,
             y_scale=y_scale,
+        )
+
+    @staticmethod
+    def fused_qk_rope_concat_and_cache_mla_decode(
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        q_out: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_scale: torch.Tensor,
+        q_scale: torch.Tensor,
+        positions: torch.Tensor,
+        cos_cache: torch.Tensor,
+        sin_cache: torch.Tensor,
+        is_neox: bool,
+        is_nope_first: bool = True,
+    ) -> None:
+        """Single launch of aiter's
+        `fuse_qk_rope_concat_and_cache_mla_per_head_kernel`.
+
+        Replaces, for the decode-token slice of an MLA layer, the four
+        kernels that vLLM otherwise launches:
+          * model-side rotary_emb on (q_pe, k_pe),
+          * `vllm::concat_and_cache_mla_kernel`,
+          * `_DecodeConcatQuantFP8` (cat + reshape + fp8 quant of the query),
+          * the MLA attn output zero-fill (caller switches to torch.empty).
+
+        Writes the fp8-quantized concatenated query into ``q_out`` and the
+        decode-token KV slots into ``kv_cache`` as a side effect. Mirrors the
+        ATOM call in `atom/model_ops/attention_mla.py::forward_impl_server_mode`.
+        """
+        # ruff: noqa: E501  # isort: skip
+        from aiter.ops.cache import fused_qk_rope_concat_and_cache_mla as aiter_fused
+
+        aiter_fused(
+            q_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            kv_cache,
+            q_out,
+            slot_mapping,
+            k_scale,
+            q_scale,
+            positions,
+            cos_cache,
+            sin_cache,
+            is_neox,
+            is_nope_first,
         )
 
     @staticmethod

@@ -302,6 +302,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         use_sparse: bool = False,
         indexer: object | None = None,
+        rotary_emb: torch.nn.Module | None = None,
         **extra_impl_args,
     ):
         super().__init__()
@@ -316,6 +317,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
+        # Plain attribute (NOT a submodule): the wrapper is the single owner
+        # of `rotary_emb` and we only need a back-reference here so the
+        # fused decode kernel can read its `cos_sin_cache` and
+        # `is_neox_style`. Using `object.__setattr__` bypasses
+        # `nn.Module.__setattr__`, which would otherwise duplicate the
+        # rotary buffers under this layer's state_dict path.
+        object.__setattr__(self, "rotary_emb", rotary_emb)
 
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -410,6 +418,37 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
         self.use_direct_call = not current_platform.opaque_attention_op()
 
+        # Make the layer_name reachable from inside impl methods (e.g. so that
+        # do_kv_cache_update can index per-layer attn metadata).
+        self.impl.layer_name = self.layer_name
+
+        # Precompute contiguous cos/sin caches for impls that fuse the
+        # decode-side RoPE into their concat+cache+quant kernel. Aiter's
+        # `fused_qk_rope_concat_and_cache_mla` expects two separate buffers
+        # of shape [max_pos, rot_dim//2] (vLLM stores them concatenated as
+        # [max_pos, rot_dim], so the chunk views are non-contiguous and
+        # cannot be passed directly).
+        if (
+            getattr(self.impl, "fuses_rope_in_decode", False)
+            and self.rotary_emb is not None
+            and hasattr(self.rotary_emb, "cos_sin_cache")
+        ):
+            cos_sin_cache: torch.Tensor = self.rotary_emb.cos_sin_cache
+            half = cos_sin_cache.shape[-1] // 2
+            self.register_buffer(
+                "_fused_rope_cos_cache",
+                cos_sin_cache[..., :half].contiguous(),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_rope_sin_cache",
+                cos_sin_cache[..., half:].contiguous(),
+                persistent=False,
+            )
+        else:
+            self._fused_rope_cos_cache = None
+            self._fused_rope_sin_cache = None
+
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -448,6 +487,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
         )
+        # Cache the availability of the single-kernel prefill RoPE + KV cache
+        # write op. When present (the common case on builds that include
+        # `csrc/cache_kernels_fused.cu`), `forward_impl` uses it for the
+        # prefill-token slice under the fused-decode path; otherwise we fall
+        # back to a 2-kernel aiter rope + standalone cache-write sequence.
+        from vllm import _custom_ops as _vllm_ops
+
+        self._has_concat_and_cache_mla_rope_fused = hasattr(
+            _vllm_ops, "concat_and_cache_mla_rope_fused"
+        )
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -480,14 +529,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
-            self.impl.do_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                slot_mapping.get(self.layer_name),
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            # Skip the standalone `concat_and_cache_mla_kernel` for the
+            # fused-decode path: the aiter
+            # `fuse_qk_rope_concat_and_cache_mla_per_head_kernel` writes
+            # the decode-token KV slots itself. `forward_impl` asserts
+            # `num_mha_tokens == 0` under this flag, so the prefill path
+            # cannot silently lose its cache writes here.
+            if not getattr(self.impl, "fuses_rope_in_decode", False):
+                self.impl.do_kv_cache_update(
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    slot_mapping.get(self.layer_name),
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             if self.attn_backend.accept_output_buffer:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 self.forward_impl(
@@ -504,13 +560,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
                 )
         else:
-            kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                self.layer_name,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            # Same fused-decode short-circuit as the direct-call branch
+            # above: aiter's `fuse_qk_rope_concat_and_cache_mla_per_head_kernel`
+            # owns the decode-token KV writes, so the standalone
+            # `concat_and_cache_mla` op is dead under that path. Hand the
+            # downstream `unified_mla_attention*` op an empty dummy so its
+            # data-dependency arg is still satisfied.
+            if getattr(self.impl, "fuses_rope_in_decode", False):
+                kv_cache_dummy_dep = torch.empty(
+                    0, device=kv_c_normed.device, dtype=kv_c_normed.dtype
+                )
+            else:
+                kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
+                    kv_c_normed,
+                    k_pe,
+                    self.layer_name,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             if self.attn_backend.accept_output_buffer:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 torch.ops.vllm.unified_mla_attention_with_output(
@@ -600,6 +667,119 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
+        # When the impl fuses the decode-side RoPE + concat + KV-cache-write +
+        # Q FP8 quant kernel, the compiled wrapper around this layer skipped
+        # the model-side rotary call entirely AND the wrapper-side
+        # `MLAAttention.forward` skipped the standalone `concat_and_cache_mla`
+        # for the *entire* batch (the fused kernel further down owns the
+        # decode-token KV writes). For the prefill-token slice (mixed
+        # batches) we therefore need to (a) apply rotary here and (b) write
+        # the prefill-token KV slots to cache here.
+        #
+        # Preferred path: a single fused CUDA/HIP kernel
+        # `concat_and_cache_mla_rope_fused` that does both at once — exactly
+        # what ATOM's `concat_and_cache_mla_rope_fused` path does for the
+        # mixed/prefill branch.
+        # Fallback (for builds that don't have the op compiled): one aiter
+        # fused-rotary HIP kernel (`rope_cached_positions_2c_fwd_inplace`)
+        # plus the standalone `concat_and_cache_mla` cache-write op. We avoid
+        # `self.rotary_emb(...)` entirely because vLLM's
+        # `DeepseekScalingRotaryEmbedding.forward_hip` falls back to the
+        # eager `forward_native` path that explodes into ~10 unfused
+        # `elementwise_kernel_manual_unroll` launches in eager mode — that
+        # was the original prefill regression.
+        impl_fuses_rope_in_decode = getattr(
+            self.impl, "fuses_rope_in_decode", False
+        )
+        if impl_fuses_rope_in_decode and num_mha_tokens > 0:
+            from vllm.forward_context import get_forward_context
+
+            forward_ctx = get_forward_context()
+            positions_full = forward_ctx.additional_kwargs.get("mla_positions")
+            assert positions_full is not None, (
+                "fused-rope MLA decode requires `mla_positions` in "
+                "forward_context.additional_kwargs (set by the model runner)"
+            )
+            slot_mapping_dict = forward_ctx.slot_mapping
+            assert isinstance(slot_mapping_dict, dict)
+
+            pf = slice(num_mqa_tokens, num_actual_toks)
+            slot_mapping_pf = slot_mapping_dict[self.layer_name][pf]
+
+            if (
+                self._has_concat_and_cache_mla_rope_fused
+                and kv_cache.numel() > 0
+            ):
+                from vllm import _custom_ops as ops
+
+                # Single fused kernel: rotates `q[pf, :, qk_nope:]` and
+                # `k_pe[pf]` in place using the model's `cos_sin_cache`,
+                # then writes the rotated `k_pe` and `k_c_normed[pf]` to
+                # `kv_cache` at `slot_mapping_pf`. Layout requirements
+                # (enforced by the kernel via TORCH_CHECK):
+                #   positions   : [num_pf]      int64
+                #   q_pe        : [num_pf, num_heads, rot_dim]
+                #   k_pe        : [num_pf, rot_dim]
+                #   kv_c        : [num_pf, kv_lora_rank]
+                #   cos_sin_cache: [max_pos, rot_dim]  (concatenated)
+                #   slot_mapping: [num_pf]      int64
+                ops.concat_and_cache_mla_rope_fused(
+                    positions_full[pf],
+                    q[pf, :, self.qk_nope_head_dim :],
+                    k_pe[pf].squeeze(1),
+                    k_c_normed[pf],
+                    self.rotary_emb.cos_sin_cache,
+                    self.rotary_emb.is_neox_style,
+                    slot_mapping_pf.flatten(),
+                    kv_cache,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+            else:
+                from aiter.ops.rope import rope_cached_positions_2c_fwd_inplace
+
+                num_pf = num_actual_toks - num_mqa_tokens
+
+                # aiter expects sbhd 4D `[s, b, h, d]` for inputs,
+                # `[max_pos, 1, 1, d // 2]` for the (split) cos/sin caches
+                # when `reuse_freqs_front_part=True`, and `[s, b]` for
+                # positions. Both `q[pf, :, qk_nope:]` and `k_pe[pf]` are
+                # the rope-only slice (head_size == qk_rope_head_dim), so
+                # `nope_first` is irrelevant — the kernel rotates the
+                # entire input.
+                q_pe_pf = q[pf, :, self.qk_nope_head_dim :].view(
+                    1, num_pf, self.num_heads, self.qk_rope_head_dim
+                )
+                k_pe_pf = k_pe[pf].view(1, num_pf, 1, self.qk_rope_head_dim)
+                positions_pf = positions_full[pf].view(1, num_pf)
+                cos_cache_4d = self._fused_rope_cos_cache.view(
+                    self._fused_rope_cos_cache.shape[0], 1, 1, -1
+                )
+                sin_cache_4d = self._fused_rope_sin_cache.view(
+                    self._fused_rope_sin_cache.shape[0], 1, 1, -1
+                )
+                rotate_style = 0 if self.rotary_emb.is_neox_style else 1
+                rope_cached_positions_2c_fwd_inplace(
+                    q_pe_pf,
+                    k_pe_pf,
+                    cos_cache_4d,
+                    sin_cache_4d,
+                    positions_pf,
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=False,
+                )
+
+                if kv_cache.numel() > 0:
+                    self.impl.do_kv_cache_update(
+                        k_c_normed[pf],
+                        k_pe[pf],
+                        kv_cache,
+                        slot_mapping_pf,
+                        self.kv_cache_dtype,
+                        self._k_scale,
+                    )
+
         if num_mha_tokens > 0:
             self.impl.forward_mha(
                 q[num_mqa_tokens:],
@@ -629,6 +809,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
+            # When the impl fuses decode-side RoPE+concat+cache+quant, the BMM
+            # must produce the unquantized (BF16) ql_nope so the fused kernel
+            # can read it as scalar_t and quantize on the fly into q_out.
+            bmm_y_scale = (
+                None
+                if impl_fuses_rope_in_decode
+                else (self._q_scale if fp8_attention else None)
+            )
+
             if self.is_aiter_triton_fp4_bmm_enabled:
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
@@ -638,7 +827,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self.W_K_scale,
                     transpose_bm=True,
                     prequant=True,
-                    y_scale=self._q_scale if fp8_attention else None,
+                    y_scale=bmm_y_scale,
                 )
             elif self.is_aiter_triton_fp8_bmm_enabled:
                 # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
@@ -666,7 +855,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if impl_fuses_rope_in_decode and self.impl.dcp_world_size <= 1:
+                # Replaces:
+                #   * model-side `rotary_emb(positions, q_pe, k_pe)` for the
+                #     decode-token slice (skipped in the wrapper),
+                #   * `_DecodeConcatQuantFP8` / `torch.cat(ql_nope, q_pe)`,
+                #   * `concat_and_cache_mla` for the decode-token slice
+                #     (skipped in `do_kv_cache_update`),
+                #   * the explicit fp8 quant of q_out.
+                # All of those collapse into a single launch of aiter's
+                # `fuse_qk_rope_concat_and_cache_mla_per_head_kernel`.
+                mqa_q = self._fused_qk_rope_concat_and_cache_mla_decode(
+                    mqa_ql_nope=mqa_ql_nope,
+                    mqa_q_pe=mqa_q_pe,
+                    k_c_normed=k_c_normed,
+                    k_pe=k_pe,
+                    kv_cache=kv_cache,
+                    num_mqa_tokens=num_mqa_tokens,
+                    fp8_attention=fp8_attention,
+                )
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
@@ -684,6 +892,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # call decode attn
             if not is_sparse_impl:
                 assert attn_metadata.decode is not None
+            # When the fused decode kernel ran, mqa_q is already a single
+            # concatenated (and optionally fp8-quantized) Tensor; impls'
+            # forward_mqa skip their internal torch.cat in that case.
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
 
             # correct dcp attn_out with lse.
@@ -706,6 +917,79 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
         return output_padded
+
+    def _fused_qk_rope_concat_and_cache_mla_decode(
+        self,
+        mqa_ql_nope: torch.Tensor,
+        mqa_q_pe: torch.Tensor,
+        k_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        num_mqa_tokens: int,
+        fp8_attention: bool,
+    ) -> torch.Tensor:
+        """Run aiter's fused decode-side RoPE + concat + KV cache write.
+
+        Produces a single concatenated query tensor of shape
+        (B, num_heads, kv_lora_rank + qk_rope_head_dim) with the FP8 quant
+        applied in-line when ``fp8_attention`` is True, and writes the
+        decode-token KV slots into ``kv_cache`` as a side effect. The model-
+        side RoPE for the decode-token slice is expected to have been skipped
+        (handled by the wrapper around this attention layer).
+        """
+        from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.forward_context import get_forward_context
+        from vllm.platforms import current_platform
+
+        forward_context = get_forward_context()
+        positions = forward_context.additional_kwargs.get("mla_positions")
+        assert positions is not None, (
+            "fused decode-rope path requires `mla_positions` to be set in "
+            "forward_context.additional_kwargs by the model wrapper"
+        )
+        slot_mapping_dict = forward_context.slot_mapping
+        assert isinstance(slot_mapping_dict, dict)
+        slot_mapping = slot_mapping_dict[self.layer_name]
+
+        decode_positions = positions[:num_mqa_tokens]
+        decode_slot_mapping = slot_mapping[:num_mqa_tokens].flatten()
+        mqa_k_c_normed = k_c_normed[:num_mqa_tokens]
+        mqa_k_pe = k_pe[:num_mqa_tokens]
+
+        out_dtype = (
+            current_platform.fp8_dtype() if fp8_attention else mqa_ql_nope.dtype
+        )
+        mqa_q = torch.empty(
+            (
+                mqa_ql_nope.shape[0],
+                mqa_ql_nope.shape[1],
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            dtype=out_dtype,
+            device=mqa_ql_nope.device,
+        )
+
+        rocm_aiter_ops.fused_qk_rope_concat_and_cache_mla_decode(
+            mqa_ql_nope,
+            mqa_q_pe,
+            mqa_k_c_normed,
+            mqa_k_pe.squeeze(1),
+            kv_cache.view(
+                kv_cache.shape[0],
+                -1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            mqa_q,
+            decode_slot_mapping,
+            self._k_scale,
+            self._q_scale,
+            decode_positions,
+            self._fused_rope_cos_cache,
+            self._fused_rope_sin_cache,
+            is_neox=self.rotary_emb.is_neox_style,
+            is_nope_first=True,
+        )
+        return mqa_q
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # we currently do not have quantized bmm's which are needed for

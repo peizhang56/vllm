@@ -106,6 +106,20 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_b_proj=self.kv_b_proj,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            rotary_emb=self.rotary_emb,
+        )
+
+        # Cache the impl flag once so the per-token forward path stays
+        # `torch.compile` friendly (no attribute lookups against the impl).
+        # When True, the MLA impl runs RoPE inside its fused decode kernel
+        # (`fuse_qk_rope_concat_and_cache_mla_per_head_kernel`), so we must
+        # skip the model-side `rotary_emb(positions, q_pe, k_pe)` call here.
+        # The prefill slice (mixed batches) is handled by `forward_impl` via
+        # a single aiter fused-rotary kernel — it does NOT fall back to the
+        # eager `forward_native` path that would explode into a swarm of
+        # `elementwise_kernel_manual_unroll` launches.
+        self._fuses_rope_in_decode = bool(
+            getattr(self.mla_attn.impl, "fuses_rope_in_decode", False)
         )
 
         self.prefix = prefix
@@ -154,7 +168,17 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        if self.rotary_emb is not None:
+        if self.rotary_emb is not None and not self._fuses_rope_in_decode:
+            # When `_fuses_rope_in_decode` is True, the MLA impl applies
+            # RoPE to the decode-token slice inside its fused decode kernel
+            # (`fuse_qk_rope_concat_and_cache_mla_per_head_kernel`), so we
+            # skip the model-side rotary call entirely for pure decode and
+            # let `forward_impl` handle the prefill slice (if any) via a
+            # single aiter fused-rotary kernel. The impl reads `positions`
+            # from `forward_context.additional_kwargs["mla_positions"]`,
+            # which is stashed by the model runner before entering the
+            # compiled forward (so the dict mutation never appears in
+            # compiled bytecode).
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )

@@ -378,6 +378,24 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         self.flash_attn_varlen_func = flash_attn_varlen_func
 
+        # Opt-in to the fused decode-side
+        # `fuse_qk_rope_concat_and_cache_mla_per_head_kernel` path. Mirrors
+        # ATOM's `attention_mla.py::forward_impl_server_mode` decode branch:
+        # one BMM + one fused RoPE/concat/cache/quant kernel + one MLA decode.
+        # Conditions:
+        #   * env var VLLM_ROCM_AITER_FUSED_MLA_DECODE=1
+        #   * fp8 KV cache (the fused kernel writes fp8 to cache)
+        #   * the MLA wrapper supplies q_lora_rank (DSv3-style; positions
+        #     are needed for in-kernel RoPE)
+        #   * head count is one the kernel was tuned for (16 effective heads
+        #     after the optional head-repeat, i.e. num_heads in {4, 8, 16})
+        self.fuses_rope_in_decode = (
+            rocm_aiter_ops.is_fused_mla_decode_enabled()
+            and kv_cache_dtype.startswith("fp8")
+            and self.q_lora_rank is not None
+            and (num_heads in (4, 8, 16))
+        )
+
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
@@ -415,13 +433,29 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         else:
             kernel_num_heads = self.num_heads
 
-        o = torch.zeros(
-            B,
-            kernel_num_heads,
-            self.kv_lora_rank,
-            dtype=attn_metadata.decode.attn_out_dtype,
-            device=q.device,
-        )
+        # `mla_a8w8_qh16_qseqlen1_gqaratio16_ps` overwrites every (B, head, lora)
+        # lane it touches, so the `torch.zeros` initial fill (visible as
+        # `vectorized_elementwise_kernel<FillFunctor<bf16>>` in profiles) is
+        # dead under the fused-decode path. Skip it to match ATOM's
+        # `_forward_decode`, which uses `torch.empty`. Stay conservative when
+        # the fused-rope path isn't on -- some non-aiter callers still rely on
+        # the zero-init.
+        if self.fuses_rope_in_decode:
+            o = torch.empty(
+                B,
+                kernel_num_heads,
+                self.kv_lora_rank,
+                dtype=attn_metadata.decode.attn_out_dtype,
+                device=q.device,
+            )
+        else:
+            o = torch.zeros(
+                B,
+                kernel_num_heads,
+                self.kv_lora_rank,
+                dtype=attn_metadata.decode.attn_out_dtype,
+                device=q.device,
+            )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 

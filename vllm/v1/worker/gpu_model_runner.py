@@ -47,6 +47,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -4031,6 +4032,14 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Stash `positions` in the active forward context so the MLA impl's
+            # fused-decode kernel can pick it up without a graph break in the
+            # compiled model forward (vLLM's compile wrapper rejects
+            # dict-mutation inside the compiled bytecode as a cudagraph
+            # buffer-mutation hazard, and fullgraph AOT capture rejects the
+            # `torch._dynamo.disable`-wrapped helper that worked around it).
+            # Harmless for non-MLA models: only `MLAAttention` reads this key.
+            get_forward_context().additional_kwargs["mla_positions"] = positions
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -5471,6 +5480,12 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                # See note in `execute_model`: stash positions for the MLA
+                # fused-decode impl. Done here too so profile_run and cudagraph
+                # capture both have it available.
+                get_forward_context().additional_kwargs["mla_positions"] = (
+                    positions
+                )
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
