@@ -1230,3 +1230,202 @@ def test_fused_kv_insert_split(num_tokens: int, kv_block_size: int):
     # RoPE (last 64): stored as bf16. The kernel recomputes the rotation, so it
     # is bf16-close to the reference rather than bit-exact (cf. test_cutedsl).
     torch.testing.assert_close(recovered[:, NOPE_DIM:], ref[:, NOPE_DIM:])
+
+
+# =============================================================================
+# G) Indexer K cache layout contract between the writer and the ROCm readers
+# =============================================================================
+def _indexer_writer_gather_roundtrip(kv_block_size: int, num_tokens: int):
+    """Store via the fused writer, read back via the ROCm prefill gather."""
+    HEAD_DIM = 128
+    ROPE_DIM = 64
+    STATE_BLOCK = 16
+    TOKEN_STRIDE = HEAD_DIM
+    SCALE_DIM = 4
+    RMS_EPS = 1e-6
+    FP8_MAX = 448.0
+    compress_ratio = 4
+    overlap = 1
+    coff = 1 + overlap
+
+    device = "cuda"
+    torch.manual_seed(0)
+
+    num_pages = (compress_ratio * num_tokens - 1) // STATE_BLOCK + 2
+    state_cache = torch.randn(
+        num_pages,
+        STATE_BLOCK,
+        2 * coff * HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    state_block_table = torch.arange(
+        num_pages, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    positions = torch.arange(
+        compress_ratio - 1,
+        compress_ratio * num_tokens,
+        compress_ratio,
+        dtype=torch.int64,
+        device=device,
+    )
+    rms_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    cos_sin_cache = torch.randn(compress_ratio * num_tokens, ROPE_DIM, device=device)
+
+    kv_n_blocks = (num_tokens + kv_block_size - 1) // kv_block_size + 1
+    kv_cache = torch.zeros(
+        kv_n_blocks,
+        kv_block_size,
+        TOKEN_STRIDE + SCALE_DIM,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    compress_norm_rope_store_triton(
+        state_cache=state_cache,
+        num_actual=num_tokens,
+        token_to_req_indices=token_to_req,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        block_table=state_block_table,
+        block_size=STATE_BLOCK,
+        state_width=coff * HEAD_DIM,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache=kv_cache,
+        k_cache_metadata=SimpleNamespace(slot_mapping=slot_mapping),
+        pdl_kwargs={},
+        head_dim=HEAD_DIM,
+        rope_head_dim=ROPE_DIM,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        use_fp4_cache=False,
+        rms_norm_weight=rms_weight,
+        rms_norm_eps=RMS_EPS,
+        quant_block=HEAD_DIM,
+        token_stride=TOKEN_STRIDE,
+        scale_dim=SCALE_DIM,
+    )
+
+    k_fp8 = torch.empty(
+        num_tokens, HEAD_DIM, dtype=current_platform.fp8_dtype(), device=device
+    )
+    k_scale = torch.empty(num_tokens, 4, dtype=torch.uint8, device=device)
+    cp_gather_indexer_k_quant_cache_triton(
+        kv_cache,
+        k_fp8,
+        k_scale,
+        torch.arange(kv_n_blocks, dtype=torch.int32, device=device).unsqueeze(0),
+        torch.tensor([0, num_tokens], dtype=torch.int32, device=device),
+        token_to_seq=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+    )
+
+    ref_quant, ref_scale = _reference_kv_compress_norm_rope(
+        state_cache,
+        state_block_table,
+        positions,
+        rms_weight,
+        cos_sin_cache,
+        compress_ratio,
+        overlap,
+        use_fp4=False,
+        rms_eps=RMS_EPS,
+        fp8_max=FP8_MAX,
+    )
+    return k_fp8, k_scale.view(torch.float32).reshape(-1), ref_quant, ref_scale
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="ROCm-only indexer K cache tiling"
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("kv_block_size", [1, 16, 64])
+def test_indexer_writer_matches_rocm_gather_layout(kv_block_size: int, num_tokens: int):
+    """The fused writer must store the layout the ROCm gather reads back.
+
+    Regression test: the writer stored each token's 128 FP8 bytes contiguously
+    while both ROCm readers interpret the page as 16x16 tiles whenever the
+    paged block size is not 1, so every gathered value came from permuted
+    bytes and the sparse top-k selected the wrong tokens.
+    """
+    k_fp8, k_scale, ref_quant, ref_scale = _indexer_writer_gather_roundtrip(
+        kv_block_size, num_tokens
+    )
+    assert torch.equal(k_fp8.view(torch.uint8), ref_quant.view(torch.uint8))
+    assert torch.equal(k_scale, ref_scale)
+
+
+def test_indexer_k_cache_tiling_is_rocm_only(monkeypatch):
+    """CUDA/XPU read this cache row-major; only ROCm expects tiles."""
+    from vllm.models.deepseek_v4.common.ops import fused_compress_quant_cache as mod
+
+    monkeypatch.setattr(mod.current_platform, "is_rocm", lambda: False)
+    assert not mod._indexer_k_cache_is_tiled(64)
+    assert not mod._indexer_k_cache_is_tiled(1)
+
+    monkeypatch.setattr(mod.current_platform, "is_rocm", lambda: True)
+    assert mod._indexer_k_cache_is_tiled(64)
+    # block_size == 1 is the untiled ("NORMAL") layout on ROCm too.
+    assert not mod._indexer_k_cache_is_tiled(1)
+    # The tile is 16 wide; a shorter page would write past the page bounds.
+    with pytest.raises(ValueError, match="multiple of 16"):
+        mod._indexer_k_cache_is_tiled(4)
+
+
+# =============================================================================
+# H) int32 block-offset guard for aiter's paged MQA logits kernel
+# =============================================================================
+def test_indexer_mirror_predicate_tracks_int32_boundary():
+    """Mirror exactly when block_id * block_stride can wrap aiter's i32."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _INT32_LIMIT,
+        _needs_int32_mirror,
+    )
+
+    page_bytes = 8448
+    # Dense cache: the kernel's own page stride, never wraps.
+    assert not _needs_int32_mirror(1 << 20, page_bytes, page_bytes)
+
+    # DeepSeek-V4 packs every layer into one per-block record, so the indexer
+    # view strides by the whole record instead of its own page.
+    packed_stride = 1002240
+    boundary = (_INT32_LIMIT - page_bytes) // packed_stride + 1
+    assert not _needs_int32_mirror(boundary, packed_stride, page_bytes)
+    assert _needs_int32_mirror(boundary + 1, packed_stride, page_bytes)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="ROCm-only aiter indexer path"
+)
+def test_indexer_mirror_copies_referenced_pages():
+    """The shadow cache reproduces every page the kernel will read."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    device = "cuda"
+    num_blocks, block_size, page_width = 8, 16, 132
+    page_bytes = block_size * page_width
+
+    # A packed record twice the indexer's page: the view is non-contiguous
+    # with stride(0) == 2 * page_bytes, exactly the shape of the live cache.
+    packed = torch.randint(
+        0, 256, (num_blocks, 2 * page_bytes), dtype=torch.uint8, device=device
+    )
+    view = packed[:, :page_bytes].view(num_blocks, block_size, 1, page_width)
+    assert not view.is_contiguous() and view.stride(0) == 2 * page_bytes
+
+    block_tables = torch.tensor([[5, 2, 7, 0]], dtype=torch.int32, device=device)
+    # Two pages of context: only blocks 5 and 2 are read.
+    context_lens = torch.tensor([2 * block_size], dtype=torch.int32, device=device)
+
+    monkey = mod._needs_int32_mirror
+    try:
+        mod._needs_int32_mirror = lambda *_: True
+        mirror = mod._mirror_if_int32_unaddressable(view, block_tables, context_lens)
+    finally:
+        mod._needs_int32_mirror = monkey
+
+    assert mirror.data_ptr() != view.data_ptr()
+    assert mirror.is_contiguous()
+    for blk in (5, 2):
+        assert torch.equal(mirror[blk], view[blk]), f"page {blk} not mirrored"

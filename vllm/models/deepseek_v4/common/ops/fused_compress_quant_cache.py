@@ -34,6 +34,32 @@ else:
 
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
+# Tile edge shared by both ROCm readers of the indexer K cache. Must stay in
+# sync with the ``block_tile_size``/``head_tile_size`` defaults of
+# ``cp_gather_indexer_k_quant_cache_triton`` and with aiter's Preshuffle tiling.
+INDEXER_K_TILE = 16
+
+
+def _indexer_k_cache_is_tiled(block_size: int) -> bool:
+    """Whether the indexer K cache must be stored as INDEXER_K_TILE^2 tiles.
+
+    The ROCm readers interpret the page as tiles whenever the paged block size
+    is not 1 -- ``cp_gather_indexer_k_quant_cache_triton`` (LAYOUT="SHUFFLE")
+    on prefill and aiter's ``deepgemm_fp8_paged_mqa_logits`` (Preshuffle=True)
+    on decode. CUDA and XPU read the same cache row-major (the
+    ``cp_gather_indexer_k_quant_cache`` custom op), so they must stay
+    row-major.
+    """
+    if not current_platform.is_rocm() or block_size == 1:
+        return False
+    if block_size % INDEXER_K_TILE:
+        raise ValueError(
+            f"ROCm indexer K cache block size must be a multiple of "
+            f"{INDEXER_K_TILE}, got {block_size}. Both readers tile the page "
+            f"at this granularity and aiter asserts the same constraint."
+        )
+    return True
+
 
 def compress_norm_rope_store_triton(
     state_cache: torch.Tensor,
@@ -75,7 +101,10 @@ def compress_norm_rope_store_triton(
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
-        kernel_kwargs = {}
+        kernel_kwargs = {
+            "KV_SWIZZLE": _indexer_k_cache_is_tiled(kv_cache.shape[1]),
+            "KV_TILE": INDEXER_K_TILE,
+        }
 
     kernel[(num_actual,)](
         # state cache
@@ -708,6 +737,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    KV_SWIZZLE: tl.constexpr = False,
+    KV_TILE: tl.constexpr = 16,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -790,7 +821,15 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
-    fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+    if KV_SWIZZLE:
+        fp8_ptr = (
+            cache_block_ptr
+            + (kv_pos_in_block // KV_TILE) * TOKEN_STRIDE * KV_TILE
+            + (kv_pos_in_block % KV_TILE) * KV_TILE
+        )
+    else:
+        fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+    # Scales stay row-major; both readers index them linearly by token.
     scale_ptr = (
         cache_block_ptr
         + kv_cache_block_size * TOKEN_STRIDE
@@ -840,7 +879,11 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     x_fp8 = x_clamped.to(tl.float8e4nv)
     x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
-    tl.store(fp8_ptr + block, x_uint8, mask=mask)
+    if KV_SWIZZLE:
+        dst = (block // KV_TILE) * (KV_TILE * KV_TILE) + (block % KV_TILE)
+    else:
+        dst = block
+    tl.store(fp8_ptr + dst, x_uint8, mask=mask)
 
     # Single float32 scale
     scale_val = tl.exp2(exponent)

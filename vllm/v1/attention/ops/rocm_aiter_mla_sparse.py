@@ -595,6 +595,114 @@ def paged_mqa_logits_module():
     return None
 
 
+# ---------------------------------------------------------------------------
+# int32 block-offset guard for aiter's paged MQA logits kernel.
+#
+# aiter gathers the indexer KV cache with AMD buffer loads: it declares the KV
+# block stride as "i32" in the kernel signature and computes
+# ``block_id * stride`` in 32-bit (``gl.amd.cdna3.buffer_load`` rejects 64-bit
+# offsets outright -- "offsets element type must be int32 or uint32"). That is
+# safe for a dense cache, where ``num_blocks * page_bytes`` stays well inside
+# int32, but DeepSeek-V4 packs every layer's page into a single per-block
+# record, so the indexer is handed a strided view whose ``stride(0)`` is the
+# whole record (~1 MB) instead of its own ~8 KB page. Every block id past
+# ``2**31 / stride`` then wraps and the kernel silently reads a different
+# block, which corrupts the sparse top-k selection.
+#
+# When the view cannot be addressed in int32, mirror the pages the kernel will
+# actually read into a dense shadow cache -- same physical block ids, dense
+# page stride -- and let aiter read that. The gather runs on a static grid and
+# skips pages beyond each request's context length, so it is CUDA-graph
+# capturable and only moves the bytes that are really read.
+# ---------------------------------------------------------------------------
+_INT32_LIMIT = 2**31
+_INDEXER_MIRROR: dict[tuple[int, int, torch.dtype, torch.device], torch.Tensor] = {}
+
+
+@triton.jit
+def _mirror_indexer_pages_kernel(
+    src_ptr,  # packed cache, block stride = src_block_stride bytes
+    dst_ptr,  # dense mirror, block stride = PAGE_BYTES
+    block_table_ptr,  # [batch, max_blocks] int32
+    context_lens_ptr,  # [batch] int32, in compressed tokens
+    src_block_stride,
+    bt_stride,
+    block_size_tok,
+    PAGE_BYTES: tl.constexpr,
+    PAGES_PER_PROG: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    p0 = tl.program_id(1) * PAGES_PER_PROG
+    ctx = tl.load(context_lens_ptr + b)
+    for i in tl.static_range(PAGES_PER_PROG):
+        p = p0 + i
+        if p * block_size_tok < ctx:
+            blk = tl.load(block_table_ptr + b * bt_stride + p).to(tl.int64)
+            src = src_ptr + blk * src_block_stride
+            dst = dst_ptr + blk * PAGE_BYTES
+            for off in tl.range(0, PAGE_BYTES, TILE):
+                idx = off + tl.arange(0, TILE)
+                m = idx < PAGE_BYTES
+                tl.store(dst + idx, tl.load(src + idx, mask=m, other=0), mask=m)
+
+
+def _needs_int32_mirror(num_blocks: int, block_stride: int, page_bytes: int) -> bool:
+    """True when aiter's i32 block offset cannot address the whole cache.
+
+    A dense cache (``block_stride == page_bytes``) is always fine. Otherwise
+    the highest byte the kernel addresses is the last block's base plus its
+    page, and that must stay inside int32.
+    """
+    if block_stride == page_bytes:
+        return False
+    return (num_blocks - 1) * block_stride + page_bytes > _INT32_LIMIT
+
+
+def _mirror_if_int32_unaddressable(
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Return a cache aiter can address in int32, mirroring only if needed."""
+    page_bytes = math.prod(kv_cache.shape[1:])
+    src_block_stride = kv_cache.stride(0)
+    num_blocks, block_size_tok = kv_cache.shape[0], kv_cache.shape[1]
+    # The check is on tensor metadata only: no device sync, so this stays
+    # usable inside a captured graph.
+    if not _needs_int32_mirror(num_blocks, src_block_stride, page_bytes):
+        return kv_cache
+
+    key = (num_blocks, page_bytes, kv_cache.dtype, kv_cache.device)
+    mirror = _INDEXER_MIRROR.get(key)
+    if mirror is None:
+        # One buffer for every layer: the mirror is written and consumed within
+        # a single kernel pair, and layers run in stream order.
+        mirror = torch.empty(
+            (num_blocks, *kv_cache.shape[1:]),
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        _INDEXER_MIRROR[key] = mirror
+
+    pages_per_prog = 4
+    grid = (block_tables.shape[0], triton.cdiv(block_tables.shape[1], pages_per_prog))
+    _mirror_indexer_pages_kernel[grid](
+        kv_cache,
+        mirror,
+        block_tables,
+        context_lens,
+        src_block_stride,
+        block_tables.stride(0),
+        block_size_tok,
+        PAGE_BYTES=page_bytes,
+        PAGES_PER_PROG=pages_per_prog,
+        TILE=1024,
+        num_warps=4,
+    )
+    return mirror
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -643,6 +751,9 @@ def rocm_fp8_paged_mqa_logits(
             batch_size, next_n, heads, _ = q_fp8.shape
             (out_logits,) = current_workspace_manager().get_simultaneous(
                 ((batch_size * next_n, max_model_len), torch.float32),
+            )
+            kv_cache_fp8 = _mirror_if_int32_unaddressable(
+                kv_cache_fp8, block_tables, context_lens
             )
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
