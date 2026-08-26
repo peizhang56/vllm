@@ -306,6 +306,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        # The draft scores the full target vocabulary (its head is the
+        # target's, aliased by load_dspark_model), so its sampled ids are
+        # already target ids and need no remap table. The speculator reads
+        # this attribute unconditionally under probabilistic drafting.
+        self.draft_id_to_target_id = None
 
     # --- Hooks used by the speculator -------------------------------------
 

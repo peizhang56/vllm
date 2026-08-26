@@ -82,7 +82,7 @@ class DSparkSpeculator(DFlashSpeculator):
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
-        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
+        if self.draft_logits is not None and getattr(model, "draft_id_to_target_id", None) is not None:
             d2t = model.draft_id_to_target_id
             self._d2t_scatter_index = (
                 torch.arange(d2t.shape[0], device=d2t.device) + d2t
