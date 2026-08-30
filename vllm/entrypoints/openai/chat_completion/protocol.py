@@ -774,6 +774,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens = default_sampling_params.get(
                 "skip_special_tokens", True
             )
+        if (thinking_token_budget := self.thinking_token_budget) is None:
+            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -825,7 +827,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
