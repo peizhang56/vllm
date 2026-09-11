@@ -898,7 +898,13 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
             cpu_tensor = pinned
         return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
     elif current_platform.is_cuda_alike():
-        return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
+        # Torch 2.10 stable::from_blob cannot own a custom deleter. Keep the
+        # pinned CPU tensor alive from Python for as long as the view exists.
+        if not cpu_tensor.is_pinned():
+            cpu_tensor = cpu_tensor.pin_memory()
+        accelerator_view = torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
+        accelerator_view._vllm_uva_cpu_backing = cpu_tensor
+        return accelerator_view
     else:
         raise ValueError(
             f"`get_accelerator_view_from_cpu_tensor` is currently "
