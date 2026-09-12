@@ -1029,6 +1029,71 @@ def test_prefill_hybrid_model_mamba_align():
     manager.free(req0)
 
 
+def test_mamba_align_external_hit_does_not_cache_an_unwritten_block():
+    """A KV-connector hit must not leave a cacheable block in a Mamba group.
+
+    In mamba_cache_mode="align" the backend addresses a request's recurrent
+    state through a single index -- the running block at
+    ``(seq_len - 1) // block_size`` -- so every block below it is unreadable and
+    allocate_new_blocks() pads that region with null blocks.
+
+    allocate_external_computed_blocks() does not know that: it allocates
+    ``cdiv(total_computed, block_size) - len(req_blocks)`` real blocks for the
+    connector to load into. A connector that does not own the state groups
+    (LMCache transfers attention only) never writes them, and cache_full_blocks
+    then hashes them *positionally* and publishes an unwritten page as this
+    group's state at the boundary. The next identical request takes a joint
+    local hit there, runs no external load to correct it, and is handed the
+    running block -- which holds nothing. Silent wrong output, no failed load.
+    """
+    block_size = 16
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 60, ["full", "mamba_align"]),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    hash_fn = sha256
+    mamba_mgr = manager.coordinator.single_type_managers[1]
+    null_block_id = mamba_mgr._null_block.block_id
+
+    # 4 full blocks + 7 tokens = 71; the connector supplies the first 3 blocks.
+    tokens = [i for i in range(4) for _ in range(block_size)] + [9] * 7
+    num_external = 3 * block_size
+
+    req0 = make_request("0", tokens, block_size, hash_fn)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    assert manager.allocate_slots(
+        req0,
+        len(tokens) - num_external,
+        num_computed,
+        computed_blocks,
+        num_external_computed_tokens=num_external,
+    )
+
+    # Everything below the running block must be null padding, including the
+    # block the external allocation asked for.
+    running_idx = (len(tokens) - 1) // block_size
+    block_ids = [b.block_id for b in mamba_mgr.req_to_blocks["0"]]
+    assert block_ids[:running_idx] == [null_block_id] * running_idx, block_ids
+    assert block_ids[running_idx] != null_block_id
+
+    manager.cache_blocks(req0, len(tokens))
+
+    # No Mamba block may be published under any prefix hash...
+    for block_hash in req0.block_hashes:
+        assert manager.block_pool.get_cached_block(block_hash, [1]) is None
+
+    # ...so a repeat of the same prompt gets no joint local hit and falls back
+    # to the connector, instead of being served from a page nobody filled.
+    req1 = make_request("1", tokens, block_size, hash_fn)
+    _, num_computed_repeat, _ = manager.get_computed_blocks(req1)
+    assert num_computed_repeat == 0
+
+    manager.free(req0)
+
+
 def test_hybrid_cache_mamba_align_shared_prefix_detection():
     """Test shared prefix detection heuristic for mamba align cache mode
 

@@ -1594,6 +1594,29 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
                 )
+                if not blocks_allocated:
+                    # A real block below the skipped region is dead weight, and
+                    # caching it is actively unsafe. In align mode the backend
+                    # addresses the state through a single index -- the running
+                    # block at (seq_len - 1) // block_size, which the kernel both
+                    # reads and writes (mamba_get_block_table_tensor) -- so a
+                    # block further down is never read. `allocate_external_
+                    # computed_blocks` leaves exactly one of them, at the tail of
+                    # a KV-connector hit's prefix, and nothing writes it when the
+                    # connector does not own this group (LMCache, for one, has no
+                    # format for recurrent state). `cache_blocks` would then hash
+                    # it *positionally* and publish it as this group's state at
+                    # that boundary; the next request with the same prompt takes
+                    # a purely local prefix hit on a page nobody ever filled, is
+                    # handed the running block instead, and answers from garbage
+                    # state with no failed load and no error logged.
+                    partial_hit_idx = partial_hit[0] if has_partial_hit else -1
+                    for idx in range(min(prev_block_len, num_skipped_blocks)):
+                        blk = req_blocks[idx]
+                        if blk != self._null_block and idx != partial_hit_idx:
+                            self.block_pool.free_blocks([blk])
+                            req_blocks[idx] = self._null_block
+
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
                     req_blocks.extend(
