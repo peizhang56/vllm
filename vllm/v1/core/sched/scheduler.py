@@ -47,6 +47,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
+    CacheAwareRequestQueue,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -183,10 +184,27 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        # Cache-aware ordering needs a prefix cache to have any signal; without
+        # one every request is fully uncached, so fall back to FCFS rather than
+        # pay the probe cost for a constant score.
+        if (
+            self.policy == SchedulingPolicy.CACHE_AWARE
+            and not self.cache_config.enable_prefix_caching
+        ):
+            logger.info(
+                "Prefix caching is disabled; falling back to FCFS scheduling "
+                "instead of the cache_aware policy."
+            )
+            self.policy = SchedulingPolicy.FCFS
+        logger.info(
+            "Scheduler policy: %s (prefix_caching=%s)",
+            self.policy.value,
+            self.cache_config.enable_prefix_caching,
+        )
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = self._create_request_queue()
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = self._create_request_queue()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -680,9 +698,17 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        # Cache-hit estimates go stale as blocks are allocated and evicted;
+        # refresh them once per step rather than per queue read. This runs
+        # unconditionally so a step that preempts instead of scheduling does
+        # not leave the next step scoring against a stale view.
+        for queue in (self.waiting, self.skipped_waiting):
+            if isinstance(queue, CacheAwareRequestQueue):
+                queue.new_scheduling_step()
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting = self._create_request_queue()
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -2055,6 +2081,34 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
+    def _create_request_queue(self) -> RequestQueue:
+        return create_request_queue(
+            self.policy,
+            uncached_tokens_fn=self._num_uncached_prefill_tokens,
+            aging_tokens_per_second=(
+                self.scheduler_config.cache_aware_aging_tokens_per_second
+            ),
+        )
+
+    def _num_uncached_prefill_tokens(self, request: Request) -> int:
+        """Prefill tokens for `request` that are not in the prefix cache.
+
+        Used as the cache_aware sort key. This must stay on the pure-query
+        `get_num_cached_tokens` path rather than `get_computed_blocks`, which
+        publishes BlockStored events -- scoring runs on requests that may never
+        be admitted, and those events would misreport them as scheduled.
+        """
+        try:
+            num_computed_tokens = self.kv_cache_manager.get_num_cached_tokens(request)
+        except Exception:
+            # Scoring must never break scheduling; treat as fully uncached.
+            logger.exception(
+                "Prefix cache probe failed for %s; treating it as uncached.",
+                request.request_id,
+            )
+            return request.num_prompt_tokens
+        return max(0, request.num_prompt_tokens - num_computed_tokens)
+
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
@@ -2064,6 +2118,27 @@ class Scheduler(SchedulerInterface):
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
+
+        if self.policy == SchedulingPolicy.CACHE_AWARE:
+            # Compare heads by uncached prefill length rather than Request
+            # ordering, which is priority/arrival-based.
+            if self.waiting and self.skipped_waiting:
+                # Score via the queues so the comparison shares their per-step
+                # probe memoization instead of re-probing the prefix cache.
+                assert isinstance(self.waiting, CacheAwareRequestQueue)
+                assert isinstance(self.skipped_waiting, CacheAwareRequestQueue)
+                waiting_score = self.waiting.uncached_tokens(
+                    self.waiting.peek_request()
+                )
+                skipped_score = self.skipped_waiting.uncached_tokens(
+                    self.skipped_waiting.peek_request()
+                )
+                return (
+                    self.waiting
+                    if waiting_score <= skipped_score
+                    else self.skipped_waiting
+                )
+            return self.waiting or self.skipped_waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.
         if self.waiting and self.skipped_waiting:
@@ -2516,6 +2591,15 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        if isinstance(self.waiting, CacheAwareRequestQueue):
+            # Whether cache-aware ordering ever overrides arrival order is a
+            # property of the workload. Log it so a benchmark that shows no
+            # change can be told apart from the policy never firing.
+            logger.info(
+                "Cache-aware scheduling: %d/%d pops reordered",
+                self.waiting.num_reordered_pops,
+                self.waiting.num_pops,
+            )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),

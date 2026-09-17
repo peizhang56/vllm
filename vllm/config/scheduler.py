@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "cache_aware"]
 
 
 @config
@@ -96,13 +96,33 @@ class SchedulerConfig:
     NOTE: This is not currently configurable. It will be overridden by
     max_num_batched_tokens in case max multimodal embedding size is larger."""
 
-    policy: SchedulerPolicy = "fcfs"
+    policy: SchedulerPolicy = "cache_aware"
     """The scheduling policy to use:
 
-    - "fcfs" means first come first served, i.e. requests are handled in order 
+    - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "cache_aware" (default) means requests are handled shortest-uncached-
+      prefill-first: requests whose prompt is already largely in the prefix
+      cache are scheduled ahead of requests needing a long cold prefill, so a
+      cold request does not head-of-line block warm ones. An aging term
+      (`cache_aware_aging_tokens_per_second`) prevents starvation. Falls back
+      to "fcfs" when prefix caching is disabled.
+
+    NOTE: "cache_aware" improves TTFT p90 when the prefix-cache miss rate is
+    low (below roughly 10% of in-flight requests). At higher miss rates the
+    tail percentile is itself a cache-missing request, and deprioritizing
+    those makes p90 worse. Set `--scheduling-policy fcfs` for such workloads.
+    """
+
+    cache_aware_aging_tokens_per_second: float = 10000.0
+    """Aging rate for the "cache_aware" policy, in uncached-token credit per
+    second of queue wait. A waiting request's effective uncached prefill
+    length is reduced by this much for every second it waits, so a request
+    with a cold prefix cannot be starved indefinitely by a stream of
+    cache-warm arrivals. Set to 0 to disable aging (not recommended: without
+    it, p99 and max TTFT are unbounded under sustained warm traffic)."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

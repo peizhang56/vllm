@@ -226,6 +226,22 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
+    def get_num_cached_tokens(self, request: Request) -> int:
+        """Number of the request's prompt tokens already in the prefix cache.
+
+        A pure query intended for scheduling decisions about requests that may
+        never be admitted: unlike `get_computed_blocks` it publishes no KV
+        cache events, and like it, it neither allocates blocks nor touches
+        refcounts or eviction order. The answer is advisory -- a block counted
+        here may be evicted before the request is scheduled.
+        """
+        if not self.prefix_cache_lookup_enabled(request):
+            return 0
+        _, num_computed_tokens, _ = self.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        return num_computed_tokens
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
