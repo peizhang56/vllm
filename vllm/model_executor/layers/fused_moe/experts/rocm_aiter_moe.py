@@ -8,6 +8,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config.attention import active_attention_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -271,6 +272,9 @@ def aiter_moe_pads(
     )
 
 
+# m-moe-input-fp8 (DSv4 SP steps, off by default): see seq_parallel_seam.SP_MOE_CODES_LABEL.
+
+
 def rocm_aiter_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -440,8 +444,8 @@ def rocm_aiter_fused_experts(
                 else GateMode.SEPARATED.value
             )
 
-        return rocm_aiter_ops.fused_moe(
-            hidden_states,
+        _call = lambda _h, _a1s: rocm_aiter_ops.fused_moe(  # noqa: E731
+            _h,
             w1,
             w2,
             topk_weights,
@@ -451,7 +455,7 @@ def rocm_aiter_fused_experts(
             activation_method=activation_method,
             w1_scale=quant_config.w1_scale,
             w2_scale=quant_config.w2_scale,
-            a1_scale=quant_config.a1_scale if a1q_scale is None else a1q_scale,
+            a1_scale=_a1s,
             a2_scale=quant_config.a2_scale,
             doweight_stage1=apply_router_weight_on_input,
             num_local_tokens=num_local_tokens,
@@ -476,6 +480,35 @@ def rocm_aiter_fused_experts(
             shared_expert_id=shared_expert_id,
             q_dtype_a=q_dtype_a,
         )
+        _a1s = quant_config.a1_scale if a1q_scale is None else a1q_scale
+        if active_attention_config().dsv4_seq_parallel:
+            # m-moe-input-fp8: the DSv4 SP seam's MXFP8 codes + e8m0 of these rows (the bf16 rows
+            # are a placeholder); fused_moe's fp8 passthrough only sorts the scales.
+            from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
+                sp_moe_codes_check,
+                sp_moe_codes_form,
+            )
+
+            form = sp_moe_codes_form(hidden_states)
+            if form is not None:
+                codes, e8m0, first = form
+                if first:
+                    from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
+                        sp_route_capture_armed,
+                        sp_route_capture_suspended,
+                    )
+
+                    # the check compares reduced outputs: run both with the slot reduce
+                    # (m-moe-route-fold's capture suspended), then capture once more if armed
+                    with sp_route_capture_suspended():
+                        out = _call(codes, e8m0)
+                        sp_moe_codes_check(
+                            out, _call(hidden_states, _a1s), hidden_states.shape[0])
+                    if sp_route_capture_armed():
+                        out = _call(codes, e8m0)
+                    return out
+                return _call(codes, e8m0)
+        return _call(hidden_states, _a1s)
 
 
 class AiterExperts(mk.FusedMoEExpertsModular):

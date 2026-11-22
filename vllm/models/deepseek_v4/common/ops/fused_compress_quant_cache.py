@@ -567,8 +567,10 @@ def _launch_two_stage_sparse_attn_compressor(
     rope_head_dim: int,
     num_actual: int,
     compress_scratch: torch.Tensor,
+    num_splits: int | None = None,
 ) -> None:
-    num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
+    if num_splits is None:
+        num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
     head_tile = head_dim // num_splits
     scratch = compress_scratch[:num_actual]
     _compress_gather_split_sparse_attn[(num_actual * num_splits,)](
@@ -639,8 +641,13 @@ def compress_norm_rope_store_two_stage_triton(
     scale_dim: int,
     num_decode_tokens: int,
     compress_scratch: torch.Tensor,
+    num_splits: int | None = None,
 ) -> None:
     """Two-stage split compressor dispatch for head=512 cr>=128 (no-overlap).
+
+    ``num_splits`` pins the stage-1 column split (default: picked from the prefill token count).
+    A caller compressing a subset of a step's tokens passes the full step's value so each
+    token's result does not depend on the subset size.
 
     Run the occupancy-fanned two-stage split for prefill [num_decodee_tokens:]
     to fill the CUs, and use the original single-pass launcher
@@ -670,6 +677,7 @@ def compress_norm_rope_store_two_stage_triton(
             rope_head_dim=rope_head_dim,
             num_actual=num_prefills,
             compress_scratch=compress_scratch,
+            num_splits=num_splits,
         )
     if num_decodes > 0:
         compress_norm_rope_store_triton(

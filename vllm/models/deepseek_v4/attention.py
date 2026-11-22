@@ -1142,10 +1142,38 @@ class DeepseekV4Indexer(nn.Module):
                     )
                 return None, None, None
 
+        row_shard = self._compact_q_row_shard(attn_metadata, qr_scale)
+        self.indexer_op.q_rows_compact = row_shard is not None
+        q_in, q_in_scale, q_positions, q_weights = (
+            qr,
+            qr_scale,
+            positions,
+            indexer_weights,
+        )
+        qr_compact = getattr(self, "_qr_compact", False)
+        if qr_compact:
+            # m-attn-rowlocal step 2b input (dsv4_rowlocal_input): the caller computed
+            # qr, its scales and the weights for the compact rows only (decode rows, then this
+            # rank's prefill window); the positions are still full-row.
+            assert row_shard is not None, "compact qr needs the indexer row shard"
+            assert qr.shape[0] == row_shard.num_decode_tokens + row_shard.stop - row_shard.start, (
+                qr.shape, row_shard.num_decode_tokens, row_shard.start, row_shard.stop)
+            q_positions = row_shard.compact_rows(positions)
+        elif row_shard is not None:
+            # Each rank scores only its prefill row window (plus the
+            # replicated decode rows), so build the index query for those rows
+            # only; the indexer op reads them at their compact offsets. The
+            # compressor below still sees every row.
+            q_in = row_shard.compact_rows(qr)
+            if qr_scale is not None:
+                q_in_scale = row_shard.compact_rows(qr_scale)
+            q_positions = row_shard.compact_rows(positions)
+            q_weights = row_shard.compact_rows(indexer_weights)
+
         def wq_b_and_q_quant():
-            q = self._wq_b_proj(qr, qr_scale)
+            q = self._wq_b_proj(q_in, q_in_scale)
             q = q.view(-1, self.n_head, self.head_dim)
-            return self._q_rope_quant(positions, q, rotary_emb, indexer_weights)
+            return self._q_rope_quant(q_positions, q, rotary_emb, q_weights)
 
         if not skip_compressor:
             # compressor returns None and writes K to the indexer KV cache; the
@@ -1164,6 +1192,36 @@ class DeepseekV4Indexer(nn.Module):
         else:
             q, q_scale = q_quant, None
         return q, q_scale, weights
+
+    def _compact_q_row_shard(self, attn_metadata, qr_scale: torch.Tensor | None):
+        """This rank's PrefillRowShard when the index query may be computed
+        for decode rows + its prefill window only, else None.
+
+        Only the ROCm FP8 indexer op (rocm_aiter_sparse_attn_indexer) reads a
+        compact query; it scores exactly these rows when the step's metadata
+        carries row_shard_sizes. Padded decode (requires_padding) reads
+        weights past the decode rows, so it keeps the full layout."""
+        if (
+            not current_platform.is_rocm()
+            or self.use_fp4_kv
+            or type(self.indexer_op) is not SparseAttnIndexer
+            or self.indexer_op.candidate_blocks is not None
+            or not isinstance(attn_metadata, dict)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        if qr_scale is not None and not qr_scale.is_contiguous():
+            return None
+        meta = attn_metadata.get(self.k_cache.prefix)
+        prefill = getattr(meta, "prefill", None)
+        if prefill is None or getattr(prefill, "row_shard_sizes", None) is None:
+            return None
+        decode = getattr(meta, "decode", None)
+        if decode is not None and decode.requires_padding:
+            return None
+        from vllm.model_executor.layers.sparse_attn_indexer import PrefillRowShard
+
+        return PrefillRowShard.from_metadata(prefill, meta.num_decode_tokens)
 
     def _wq_b_proj(
         self, qr: torch.Tensor, qr_scale: torch.Tensor | None = None

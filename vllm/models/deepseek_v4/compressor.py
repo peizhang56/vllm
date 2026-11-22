@@ -87,6 +87,10 @@ class CompressorMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     num_decode_tokens: int | None = None
     c128_boundary: bool | None = None
+    # Host copies of the step's request layout (m-compressor-shard: the ROCm sequence-parallel
+    # compressor shard plans window ownership from them without a device sync).
+    query_start_loc_cpu: torch.Tensor | None = None
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -133,6 +137,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
                 if self.block_size == 8 and not async_spec_decode
                 else None
             ),
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         )
 
 
@@ -354,11 +360,15 @@ class DeepseekCompressor(nn.Module):
     def forward(
         self,
         # [num_tokens, 2 * self.coff * self.head_dim]
-        kv_score: torch.Tensor,
+        kv_score: torch.Tensor | None,
         # [num_tokens]
         positions: torch.Tensor,
         rotary_emb,
     ) -> None:
+        if kv_score is None:
+            # The ROCm sequence-parallel compressor shard (m-compressor-shard) already ran this
+            # layer's GEMM, state save, compress and row exchange for the step.
+            return
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
         kv, score = kv_score.split(

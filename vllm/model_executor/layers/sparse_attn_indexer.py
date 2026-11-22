@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import functools
+
 import torch
 import torch.distributed as dist
 
@@ -14,6 +16,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
+from vllm.config.attention import active_attention_config
 from vllm.distributed import (
     get_dcp_group,
     get_pcp_group,
@@ -365,17 +368,72 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+# exchange_topk_uniform gathers world * max(sizes) rows; above this multiple of
+# the real row count it falls back to the variable-size gather.
+_UNIFORM_EXCHANGE_MAX_PAD = 2
+
+
+# m-attn-rowlocal step 2b (indexer half). Behind dsv4_rowlocal_input=1
+# (default off; only acts together with dsv4_rowlocal_attention=1): on a
+# row-local sequence-parallel step each rank's sparse MLA reads the top-k of its
+# own SP rows [start, start + s) only. The prefill row shard is then aligned to
+# those rows (instead of the indexer-cost-balanced windows) and the top-k
+# exchange is skipped: every rank scores exactly the prefill rows it later
+# reads. Rows are independent, so each row's index set is the one the exchanged
+# path computes (eval/eval_rowlocal_indexer.py). Decode rows are untouched.
+ROWLOCAL_INDEXER_LABEL = "dsv4_rowlocal_input"
+# dsv4_rowlocal_input=1 (step 2b input side, models/deepseek_v4/amd/rocm.py) builds the
+# indexer query for the row-local rows only, so it implies this indexer half.
+_ROWLOCAL_INDEXER_LOGGED = [False]
+# (start, s): this rank's SP rows on the current row-local step, else None.
+_ROWLOCAL_ROWS: "tuple[int, int] | None" = None
+
+
+def set_rowlocal_rows(rows: "tuple[int, int] | None") -> None:
+    """Set (start, s) of this rank's SP rows around a row-local attention call."""
+    global _ROWLOCAL_ROWS
+    _ROWLOCAL_ROWS = rows if active_attention_config().dsv4_rowlocal_input else None
+
+
+def _rowlocal_sizes(num_decode_tokens: int, num_prefill: int, start: int,
+                    s: int, world: int) -> list[int]:
+    """Prefill rows of each rank's uniform SP slice [k*s, (k+1)*s) of the step."""
+    m = num_decode_tokens + num_prefill
+    out = []
+    for k in range(world):
+        lo = min(max(k * s, num_decode_tokens), m)
+        hi = min(max((k + 1) * s, num_decode_tokens), m)
+        out.append(hi - lo)
+    assert num_decode_tokens + sum(out[:get_tensor_model_parallel_rank()]) == min(
+        max(start, num_decode_tokens), m)
+    return out
+
+
+@functools.lru_cache(maxsize=64)
+def _uniform_gather_rowmap(
+    sizes: tuple[int, ...], max_rows: int, device: torch.device
+) -> torch.Tensor:
+    """Row r of rank k sits at k * max_rows + r in a padded uniform gather."""
+    return torch.cat(
+        [torch.arange(k * max_rows, k * max_rows + n) for k, n in enumerate(sizes)]
+    ).to(device)
+
+
 class PrefillRowShard:
     """One TP rank's contiguous slice of the replicated prefill rows.
 
     Rows are independent, so each rank scores only its slice and the group
     exchanges final int32 top-k indices instead of the logits."""
 
-    def __init__(self, num_decode_tokens: int, sizes: list[int], rank: int):
+    def __init__(self, num_decode_tokens: int, sizes: list[int], rank: int,
+                 local_only: bool = False):
         self.num_decode_tokens = num_decode_tokens
         self.sizes = sizes
         self.start = num_decode_tokens + sum(sizes[:rank])
         self.stop = self.start + sizes[rank]
+        # Row-local step (dsv4_rowlocal_input): no rank reads
+        # another rank's rows, so the exchange is a no-op.
+        self.local_only = local_only
 
     @classmethod
     def from_metadata(
@@ -384,7 +442,21 @@ class PrefillRowShard:
         sizes = getattr(prefill_metadata, "row_shard_sizes", None)
         if sizes is None:
             return None
-        return cls(num_decode_tokens, sizes, get_tensor_model_parallel_rank())
+        rank = get_tensor_model_parallel_rank()
+        rows = _ROWLOCAL_ROWS
+        if rows is not None and not torch.cuda.is_current_stream_capturing():
+            start, s = rows
+            local = _rowlocal_sizes(num_decode_tokens, sum(sizes), start, s,
+                                    len(sizes))
+            if not _ROWLOCAL_INDEXER_LOGGED[0]:
+                _ROWLOCAL_INDEXER_LOGGED[0] = True
+                logger.info(
+                    "%s (m-attn-rowlocal step 2b): row-local indexer shard "
+                    "dispatched on rank %d (prefill rows %s of %d, balanced "
+                    "%s; top-k exchange skipped)", ROWLOCAL_INDEXER_LABEL, rank,
+                    local, sum(sizes), sizes)
+            return cls(num_decode_tokens, local, rank, local_only=True)
+        return cls(num_decode_tokens, sizes, rank)
 
     def narrow(self, chunk) -> "tuple[int, int, torch.Tensor, torch.Tensor] | None":
         """Row window and narrowed causal bounds of ``chunk`` for this rank."""
@@ -395,8 +467,52 @@ class PrefillRowShard:
         lo, hi = start - chunk.token_start, end - chunk.token_start
         return start, end, chunk.cu_seqlen_ks[lo:hi], chunk.cu_seqlen_ke[lo:hi]
 
+    def compact_rows(self, t: torch.Tensor) -> torch.Tensor:
+        """Rows [0, num_decode_tokens) U [start, stop) of ``t``, in that order.
+
+        The layout of a query computed for this rank's rows only: decode rows
+        first (they stay replicated), then this rank's prefill window."""
+        nd = self.num_decode_tokens
+        if nd == 0:
+            return t[self.start : self.stop]
+        return torch.cat((t[:nd], t[self.start : self.stop]), dim=0)
+
+    def exchange_topk_uniform(self, topk_buffer: torch.Tensor, width: int) -> None:
+        """``exchange_topk`` as one uniform all_gather of max(sizes)-row slices
+        plus a single row compaction; the same rows land in the same places.
+
+        A variable-size gather (PyNCCL all_gatherv) issues one broadcast per
+        rank; the padded uniform gather is one collective (~1.6x faster at
+        4096-8192 rows on MI355X TP8)."""
+        if self.local_only:
+            return
+        world = len(self.sizes)
+        max_rows = max(self.sizes)
+        if world * max_rows > _UNIFORM_EXCHANGE_MAX_PAD * sum(self.sizes):
+            # Skewed shards (a cold chunk next to a cached tail): padding would
+            # move several times the rows; the variable-size gather is cheaper.
+            self.exchange_topk(topk_buffer, width)
+            return
+        local_rows = self.stop - self.start
+        padded = torch.empty(
+            (max_rows, width), dtype=topk_buffer.dtype, device=topk_buffer.device
+        )
+        padded[:local_rows].copy_(topk_buffer[self.start : self.stop, :width])
+        # Pad rows are never read back: the rowmap skips them.
+        gathered = get_tp_group().all_gather(padded, dim=0)
+        assert gathered.shape[0] == world * max_rows
+        rowmap = _uniform_gather_rowmap(
+            tuple(self.sizes), max_rows, topk_buffer.device
+        )
+        end = self.num_decode_tokens + sum(self.sizes)
+        topk_buffer[self.num_decode_tokens : end, :width] = torch.index_select(
+            gathered, 0, rowmap
+        )
+
     def exchange_topk(self, topk_buffer: torch.Tensor, width: int) -> None:
         """Gather per-rank final indices back into global row order."""
+        if self.local_only:
+            return
         # The local input must outlive the async PyNCCL gather's enqueued copy.
         local = topk_buffer[self.start : self.stop, :width].contiguous()
         end = self.num_decode_tokens + sum(self.sizes)
@@ -406,7 +522,7 @@ class PrefillRowShard:
 
 
 def _reserve_row_shard_exchange_transient(
-    topk_indices_buffer: torch.Tensor, device: torch.device
+    topk_indices_buffer: torch.Tensor, device: torch.device, uniform: bool = False
 ) -> None:
     """Profiling/dummy runs return before ``exchange_topk`` executes; reserve
     its worst-case transient so the memory profile accounts for it.
@@ -427,8 +543,11 @@ def _reserve_row_shard_exchange_transient(
     ):
         return
     rows, width = topk_indices_buffer.shape[:2]
+    # exchange_topk_uniform: padded slice (<= MAX_PAD * rows / world) + the
+    # gathered buffer (<= MAX_PAD * rows) + the compacted rows (rows).
+    factor = 2 * _UNIFORM_EXCHANGE_MAX_PAD + 1 if uniform else 2
     _ = torch.empty(
-        2 * rows * width * topk_indices_buffer.element_size(),
+        factor * rows * width * topk_indices_buffer.element_size(),
         dtype=torch.uint8,
         device=device,
     )
@@ -1046,6 +1165,9 @@ class SparseAttnIndexer(CustomOp):
         self.candidate_block_size = candidate_block_size
         self.candidate_write = candidate_write
         self.dense_mha_metadata_layer_name = ""
+        # Set per step by the model's indexer when it computed the query only
+        # for decode rows + this rank's prefill row-shard window (ROCm DSv4).
+        self.q_rows_compact = False
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
@@ -1216,6 +1338,7 @@ class SparseAttnIndexer(CustomOp):
                 candidate_blocks=self.candidate_blocks,
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=self.candidate_write,
+                q_rows_compact=self.q_rows_compact,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path requires AITER or a supported "

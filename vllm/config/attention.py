@@ -128,6 +128,35 @@ class AttentionConfig:
     with defaults when HiSparseConnector is configured (directly or via
     MultiConnector); set it explicitly only to tune its fields."""
 
+    dsv4_seq_parallel: bool = False
+    """DeepSeek-V4 on ROCm gfx950 (TP8): sequence-parallel mHC seams on steps of at
+    least 1024 rows (INT4 reduce-scatter, fp8 gather, and the router, compressor
+    and reduce folds). Ignored, with the reasons logged, when the deployment cannot
+    run it. No effect on other models."""
+
+    dsv4_rowlocal_attention: bool = False
+    """DeepSeek-V4 on ROCm: row-local attention on sequence-parallel steps. Each rank
+    loads the full wq_b, wo_a and wo_b (about 15 GiB of KV cache per GPU). Needs
+    dsv4_seq_parallel."""
+
+    dsv4_rowlocal_input: bool = False
+    """DeepSeek-V4 on ROCm: on a row-local sequence-parallel step, skip the attention
+    layer-input gather and align the indexer shard to the rank's own rows. Needs
+    dsv4_rowlocal_attention."""
+
+    dsv4_attn_e8m0: bool = False
+    """DeepSeek-V4 on ROCm: e8m0 scale route for the attention GEMMs (FlyDSL mxscale
+    bpreshuffle, gfx950)."""
+
+    dsv4_sp_self_check: bool = False
+    """Debug only: one-time bitwise self-checks of the sequence-parallel path against
+    the unfused path. A check that fails on one rank raises there while the other
+    ranks wait in the next collective."""
+
+    kv_zero_coalesce: bool = False
+    """Zero each newly allocated KV block's bytes once instead of once per overlapping
+    per-layer page. Exact: the same kernel writes the same bytes."""
+
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""
 
@@ -261,3 +290,21 @@ class AttentionConfig:
                 backend = AttentionBackendEnum[backend.upper()]
             parsed[kind] = backend
         return parsed
+
+
+# The DeepSeek-V4 switches above are read by the model code through the attention config of
+# the worker process (set in Worker.init_device before the model is built). They are not
+# environment variables.
+_active_attention_config: AttentionConfig | None = None
+
+
+def set_active_attention_config(cfg: AttentionConfig) -> None:
+    global _active_attention_config
+    _active_attention_config = cfg
+
+
+def active_attention_config() -> AttentionConfig:
+    """The attention config of this process (defaults if none was set)."""
+    if _active_attention_config is not None:
+        return _active_attention_config
+    return AttentionConfig()

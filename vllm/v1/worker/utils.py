@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.config import CacheConfig
+from vllm.config.attention import active_attention_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_trackers
@@ -100,6 +101,44 @@ def _zero_kv_blocks_kernel(
         tl.zeros([BLOCK_SIZE], dtype=tl.int32),
         mask=cols < page_size_el,
     )
+
+
+# m-zero-kv-blocks (default off): zero each newly allocated block's byte set once instead of
+# once per overlapping per-layer page. Exact: the same kernel writes the same bytes.
+KV_ZERO_COALESCE_LABEL = "kv_zero_coalesce"
+_KV_ZERO_COALESCE_PIECE_BYTES = 16384
+_KV_ZERO_COALESCE_BLOCK = 4096
+
+
+def _coalesce_zero_segments(
+    seg_addrs: list[int], seg_block_strides: list[int], seg_page_sizes: list[int]
+) -> tuple[list[int], list[int], list[int]]:
+    """Union the per-segment byte intervals per block stride and cut them into pieces.
+
+    Addresses are bytes, strides and page sizes are int32 elements (as in the kernel).
+    """
+    by_stride: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for a, st, pg in zip(seg_addrs, seg_block_strides, seg_page_sizes):
+        by_stride[st].append((a, a + pg * 4))
+    out_a: list[int] = []
+    out_s: list[int] = []
+    out_p: list[int] = []
+    for st in sorted(by_stride):
+        union: list[list[int]] = []
+        for s, e in sorted(by_stride[st]):
+            if union and s <= union[-1][1]:
+                union[-1][1] = max(union[-1][1], e)
+            else:
+                union.append([s, e])
+        for s, e in union:
+            while s < e:
+                n = min(_KV_ZERO_COALESCE_PIECE_BYTES, e - s)
+                assert s % 4 == 0 and n % 4 == 0
+                out_a.append(s)
+                out_s.append(st)
+                out_p.append(n // 4)
+                s += n
+    return out_a, out_s, out_p
 
 
 class KVBlockZeroer:
@@ -218,8 +257,30 @@ class KVBlockZeroer:
             self._meta = None
             return
 
+        self._coalesced = active_attention_config().kv_zero_coalesce
+        self._dispatch_logged = False
+        if self._coalesced:
+            # m-zero-kv-blocks: under block-major (BLHNC) layouts a segment's page spans the
+            # block's later layers, so per-layer pages overlap (DSv4 on MI355X: 198 segments
+            # write 3.29x the block's bytes). Replace the table by the union of the byte
+            # intervals of the segments that share a block stride, cut into equal pieces.
+            # For a fixed block b, segment i writes [addr_i + b*S, addr_i + b*S + page_i);
+            # the union over i is the union of [addr_i, addr_i + page_i) translated by b*S,
+            # so the coalesced table writes exactly the same byte set, once.
+            n_before = len(seg_addrs)
+            seg_addrs, seg_block_strides, seg_page_sizes = _coalesce_zero_segments(
+                seg_addrs, seg_block_strides, seg_page_sizes
+            )
+            logger.info(
+                "%s (m-zero-kv-blocks): KV block zeroer coalesced %d -> %d segments",
+                KV_ZERO_COALESCE_LABEL, n_before, len(seg_addrs),
+            )
+
         max_page_size_el = max(seg_page_sizes)
-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
+        blk_size = min(
+            1 << (max_page_size_el - 1).bit_length(),
+            _KV_ZERO_COALESCE_BLOCK if self._coalesced else 1024,
+        )
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
@@ -251,6 +312,18 @@ class KVBlockZeroer:
             idx,
             BLOCK_SIZE=blk_size,
         )
+        if self._coalesced and not self._dispatch_logged:
+            self._dispatch_logged = True
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            logger.info(
+                "%s (m-zero-kv-blocks): coalesced KV block zeroing dispatched "
+                "(%d segments, BLOCK_SIZE %d) on rank %d",
+                KV_ZERO_COALESCE_LABEL, n_segs, blk_size, rank,
+            )
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""

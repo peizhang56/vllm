@@ -30,6 +30,28 @@ else:
 
 logger = init_logger(__name__)
 
+# Set once the first row-sharded indexer prefill runs (dispatch proof in the log).
+_ROW_SHARD_LOGGED = False
+_Q_COMPACT_LOGGED = False
+_DECODE_SHARD_LOGGED = False
+# TP row-sharding of the decode indexer rows (logits + top-k), the decode
+# counterpart of the prefill PrefillRowShard. Always on.
+# Decode steps of at most this many rows are left replicated: the DSv4 mono
+# decode layer's steps (<= 64 rows) and short batches where the per-layer
+# exchange (~16 us) outweighs the scoring it saves.
+_DECODE_ROW_SHARD_MIN_ROWS = 65
+# m-itl-stack F (decode fills). On a decode-only step served by the decode row
+# shard, the per-layer `topk_indices_buffer[:N] = -1` reset and the -1 init of
+# the rank's local top-k are dead stores: the decode top-k kernels write all k
+# columns of every row they score (short rows padded with -1), the exchange then
+# overwrites rows [:num_rows] of the buffer (width == index_topk == k), and the
+# local rows past the rank's share are sliced off. Only rows [num_rows, N) of
+# the buffer, if any, still need the -1. Bitwise (eval/eval_decode_nofill.py).
+_DECODE_NOFILL_LOGGED = False
+def _decode_exchange_all_gather(tp, local: torch.Tensor) -> torch.Tensor:
+    """Uniform all-gather of the decode row shard's top-k (dim 0)."""
+    return tp.all_gather(local, dim=0)
+
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
@@ -1149,6 +1171,7 @@ def rocm_aiter_sparse_attn_indexer_fake(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    q_rows_compact: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -1173,6 +1196,7 @@ def rocm_aiter_sparse_attn_indexer(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    q_rows_compact: bool = False,
 ) -> torch.Tensor:
     from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1220,6 +1244,25 @@ def rocm_aiter_sparse_attn_indexer(
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
+        # The dummy run returns before the row-shard top-k exchange; reserve
+        # its transient (no-op unless TP prefill row-sharding is enabled, and
+        # skipped when no step can reach indexer_tp_shard_min_rows).
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        shard_reachable = cfg is None or (
+            cfg.scheduler_config.max_num_batched_tokens
+            >= cfg.attention_config.indexer_tp_shard_min_rows
+        )
+        if (topk_indices_buffer is not None and candidate_blocks is None
+                and shard_reachable):
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                _reserve_row_shard_exchange_transient,
+            )
+
+            _reserve_row_shard_exchange_transient(
+                topk_indices_buffer, hidden_states.device, uniform=True
+            )
 
         return rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
@@ -1240,6 +1283,7 @@ def rocm_aiter_sparse_attn_indexer(
             candidate_blocks,
             candidate_block_size,
             candidate_write,
+            q_rows_compact,
         )
     layer_attn_metadata = attn_metadata[k_cache_prefix]
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
@@ -1249,7 +1293,12 @@ def rocm_aiter_sparse_attn_indexer(
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    num_buffer_rows = hidden_states.shape[0]
+    # m-itl-stack F: a decode-only step defers the reset to the decode branch,
+    # which skips it on the row-shard path (rows it overwrites).
+    defer_fill = has_decode and not has_prefill
+    if not defer_fill:
+        topk_indices_buffer[:num_buffer_rows] = -1
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
@@ -1277,7 +1326,68 @@ def rocm_aiter_sparse_attn_indexer(
             ((total_seq_lens, head_dim), FP8_DTYPE),
             ((total_seq_lens, 4), torch.uint8),
         )
+        # TP prefill row-sharding (the CUDA path's PrefillRowShard): each rank
+        # scores only its cost-balanced row window, then the ranks exchange the
+        # final int32 top-k. Rows are independent, so the result is the same
+        # as scoring every row on every rank. DSV4.1 candidate rows stay
+        # replicated, as on CUDA.
+        row_shard = None
+        if candidate_blocks is None:
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                PrefillRowShard,
+            )
+
+            row_shard = PrefillRowShard.from_metadata(
+                prefill_metadata, num_decode_tokens
+            )
+            global _ROW_SHARD_LOGGED
+            if row_shard is not None and not _ROW_SHARD_LOGGED:
+                _ROW_SHARD_LOGGED = True
+                logger.info(
+                    "ROCm sparse indexer: TP prefill row-sharding active; "
+                    "first sharded step scores rows [%d, %d) of %d prefill "
+                    "rows here, top-k exchanged by all_gatherv",
+                    row_shard.start,
+                    row_shard.stop,
+                    sum(row_shard.sizes),
+                )
+        # q_rows_compact: the model computed the index query (and weights)
+        # only for rows [0, num_decode) U [shard.start, shard.stop), stacked
+        # in that order, so prefill row r lives at r - q_row_offset.
+        q_row_offset = 0
+        if q_rows_compact:
+            assert row_shard is not None, (
+                "compact index query rows need an active prefill row shard"
+            )
+            local_rows = row_shard.stop - row_shard.start
+            assert q_fp8.shape[0] == num_decode_tokens + local_rows, (
+                q_fp8.shape,
+                num_decode_tokens,
+                local_rows,
+            )
+            assert weights.shape[0] == q_fp8.shape[0], (weights.shape, q_fp8.shape)
+            q_row_offset = row_shard.start - num_decode_tokens
+            global _Q_COMPACT_LOGGED
+            if not _Q_COMPACT_LOGGED:
+                _Q_COMPACT_LOGGED = True
+                logger.info(
+                    "ROCm sparse indexer: index query computed for decode rows "
+                    "+ this rank's prefill rows only (%d of %d rows); top-k "
+                    "exchanged by uniform all_gather",
+                    q_fp8.shape[0],
+                    num_decode_tokens + sum(row_shard.sizes),
+                )
         for chunk in prefill_metadata.chunks:
+            row_start, row_end = chunk.token_start, chunk.token_end
+            cu_seqlen_ks, cu_seqlen_ke = chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
+            if row_shard is not None:
+                narrowed = row_shard.narrow(chunk)
+                if narrowed is None:
+                    # Every chunk gathers its own K below (no workspace reuse
+                    # across chunks on this path), so a chunk with no local
+                    # rows skips the gather too.
+                    continue
+                row_start, row_end, cu_seqlen_ks, cu_seqlen_ke = narrowed
             k_fp8 = k_fp8_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
             cp_gather_indexer_k_quant_cache_triton(
@@ -1291,12 +1401,13 @@ def rocm_aiter_sparse_attn_indexer(
                     "NORMAL" if _indexer_k_is_c4a_block_flat(compress_ratio) else None
                 ),
             )
+            q_lo, q_hi = row_start - q_row_offset, row_end - q_row_offset
             logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
+                q_fp8[q_lo:q_hi],
                 (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
+                weights[q_lo:q_hi],
+                cu_seqlen_ks,
+                cu_seqlen_ke,
             )
             if candidate_blocks is not None:
                 from vllm.model_executor.layers.sparse_attn_indexer import (
@@ -1308,8 +1419,8 @@ def rocm_aiter_sparse_attn_indexer(
                 if candidate_write:
                     _select_candidate_blocks(
                         logits,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
                         chunk_candidates.shape[1],
                         candidate_block_size,
                         chunk_candidates,
@@ -1317,14 +1428,12 @@ def rocm_aiter_sparse_attn_indexer(
                 else:
                     _apply_candidate_mask(
                         logits,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
                         chunk_candidates,
                         candidate_block_size,
                     )
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
+            topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]
 
             num_rows = logits.shape[0]
 
@@ -1337,22 +1446,29 @@ def rocm_aiter_sparse_attn_indexer(
             ):
                 _launch_aiter_top_k_per_row_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
                     topk_indices,
                     topk_tokens,
                 )
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
                     topk_indices,
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
                     topk_tokens,
                 )
+
+        if row_shard is not None:
+            # Rows are already fully ranked, so this is a layout gather.
+            if q_rows_compact:
+                row_shard.exchange_topk_uniform(topk_indices_buffer, topk_tokens)
+            else:
+                row_shard.exchange_topk(topk_indices_buffer, topk_tokens)
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -1378,6 +1494,55 @@ def rocm_aiter_sparse_attn_indexer(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+
+        row_shard_applies = _decode_row_shard_applies(
+            num_padded_tokens,
+            next_n,
+            compress_ratio,
+            candidate_blocks,
+            decode_metadata.requires_padding,
+        )
+        if defer_fill and not (
+            row_shard_applies and topk_tokens == topk_indices_buffer.shape[1]
+        ):
+            topk_indices_buffer[:num_buffer_rows] = -1
+            defer_fill = False
+        if row_shard_applies:
+            if defer_fill:
+                # Rows [:num_padded_tokens] are all overwritten by the
+                # exchange; reset only the rows past them.
+                if num_buffer_rows > num_padded_tokens:
+                    topk_indices_buffer[num_padded_tokens:num_buffer_rows] = -1
+                global _DECODE_NOFILL_LOGGED
+                if not _DECODE_NOFILL_LOGGED:
+                    _DECODE_NOFILL_LOGGED = True
+                    from vllm.distributed import get_tensor_model_parallel_rank
+
+                    logger.info(
+                        "m-itl-stack F: decode row-shard indexer without the "
+                        "-1 fills dispatched on rank %d (%d of %d buffer rows "
+                        "overwritten, capturing=%s)",
+                        get_tensor_model_parallel_rank(),
+                        num_padded_tokens,
+                        num_buffer_rows,
+                        torch.cuda.is_current_stream_capturing(),
+                    )
+            _decode_row_shard_indexer(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights,
+                decode_metadata,
+                max_model_len,
+                compress_ratio,
+                topk_tokens,
+                topk_indices_buffer,
+                num_padded_tokens,
+                # Same replay-safe bound as the replicated path below.
+                max_model_len
+                if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                else layer_attn_metadata.max_seq_len // compress_ratio,
+            )
+            return topk_indices_buffer
 
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
@@ -1471,6 +1636,129 @@ def rocm_aiter_sparse_attn_indexer(
             )
 
     return topk_indices_buffer
+
+
+
+def _decode_row_shard_applies(
+    num_rows: int,
+    next_n: int,
+    compress_ratio: int,
+    candidate_blocks: torch.Tensor | None,
+    requires_padding: bool,
+) -> bool:
+    """Every input is identical on all TP ranks, so all ranks take the same
+    branch and the exchange's collective is entered by all of them."""
+    if candidate_blocks is not None:
+        return False
+    # Flattened single-token rows on the block-flat C4A Triton logits path;
+    # the AITER logits path's schedule metadata is per batch, not per row.
+    if next_n != 1 or requires_padding:
+        return False
+    if not _indexer_k_is_c4a_block_flat(compress_ratio):
+        return False
+    if num_rows < _DECODE_ROW_SHARD_MIN_ROWS:
+        return False
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    return get_tensor_model_parallel_world_size() > 1
+
+
+def _decode_row_shard_indexer(
+    padded_q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    decode_metadata,
+    max_model_len: int,
+    compress_ratio: int,
+    topk_tokens: int,
+    topk_indices_buffer: torch.Tensor,
+    num_rows: int,
+    max_compressed_seq_len: int,
+) -> None:
+    """Score rows [r*per, (r+1)*per) of the decode rows on TP rank r, then
+    exchange the final int32 top-k with one uniform all_gather.
+
+    The decode rows are flattened single-token rows (next_n == 1) with their
+    own context length and block-table row, so each row's logits and top-k
+    depend on that row alone: the gathered buffer holds the same index sets as
+    scoring every row on every rank. All shapes are static per row count, so
+    the step stays capturable in a FULL CUDA graph."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
+
+    tp = get_tp_group()
+    world = tp.world_size
+    rank = get_tensor_model_parallel_rank()
+    per = (num_rows + world - 1) // world
+    lo = min(rank * per, num_rows)
+    hi = min(lo + per, num_rows)
+    n = hi - lo
+
+    # m-itl-stack F: the top-k writes all k columns of rows [:n]; rows
+    # [n, per) are sliced off after the exchange.
+    local = torch.empty(
+        (per, topk_tokens), dtype=torch.int32, device=padded_q.device
+    )
+    if n > 0:
+        seq_lens = decode_metadata.seq_lens.reshape(-1)
+        assert seq_lens.shape[0] == num_rows, (seq_lens.shape, num_rows)
+        local_lens = seq_lens[lo:hi]
+        logits = rocm_fp8_paged_mqa_logits(
+            padded_q[lo:hi],
+            kv_cache,
+            weights[lo:hi],
+            local_lens,
+            decode_metadata.block_table[lo:hi],
+            decode_metadata.schedule_metadata,
+            max_model_len=max_model_len,
+            compress_ratio=compress_ratio,
+        )
+        if rocm_aiter_ops.is_indexer_top_k_supported(
+            is_prefill=False,
+            compress_ratio=compress_ratio,
+            num_rows=n,
+            max_valid_seq_len=max_compressed_seq_len,
+            topk_tokens=topk_tokens,
+        ) and not rocm_aiter_ops.dsv4_indexer_prefers_native_top_k(
+            num_rows=n,
+            num_columns=logits.shape[1],
+            topk_tokens=topk_tokens,
+        ):
+            topk_kind = "aiter"
+            rocm_aiter_ops.indexer_top_k_decode(
+                logits, 1, local_lens, local[:n], topk_tokens
+            )
+        else:
+            topk_kind = "native"
+            torch.ops._C.top_k_per_row_decode(
+                logits,
+                1,
+                local_lens,
+                local[:n],
+                n,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
+    else:
+        topk_kind = "none"
+    gathered = _decode_exchange_all_gather(tp, local)
+    topk_indices_buffer[:num_rows, :topk_tokens] = gathered[:num_rows]
+
+    global _DECODE_SHARD_LOGGED
+    if not _DECODE_SHARD_LOGGED:
+        _DECODE_SHARD_LOGGED = True
+        logger.info(
+            "ROCm sparse indexer: TP decode row-sharding active "
+            "(decode row shard always on); rank %d scores "
+            "decode rows [%d, %d) of %d, top-k=%s, exchanged by uniform "
+            "all_gather",
+            rank,
+            lo,
+            hi,
+            num_rows,
+            topk_kind,
+        )
 
 
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:

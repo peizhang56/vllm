@@ -249,10 +249,14 @@ def tp_prefill_row_sharding_supported(
     use_pcp: bool,
     tp_size: int,
 ) -> bool:
-    """Whether replicated prefill rows may be sharded across TP ranks."""
+    """Whether replicated prefill rows may be sharded across TP ranks.
+
+    ROCm: the FP8 indexer op (``rocm_aiter_sparse_attn_indexer``) honours the
+    shard and exchanges the int32 top-k over RCCL; mixed steps there run
+    eager (FULL_DECODE_ONLY), which the mixed-mode check below requires."""
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
     return (
-        current_platform.is_cuda()
+        (current_platform.is_cuda() or current_platform.is_rocm())
         and dcp_world_size == 1
         and not use_pcp
         and tp_size > 1
