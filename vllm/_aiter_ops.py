@@ -2668,6 +2668,50 @@ class rocm_aiter_ops:
 
     @classmethod
     @if_aiter_supported
+    def is_quick_reduce_scatter_available(cls, world_size: int) -> bool:
+        """Whether AITER's INT4 QuickReduce reduce-scatter takes `world_size`.
+
+        Older AITER builds accept four ranks only and do not export
+        `SUPPORTED_WORLD_SIZES`.
+        """
+        if not cls._AITER_ENABLED:
+            return False
+        try:
+            from aiter.ops.quick_reduce_scatter import SUPPORTED_WORLD_SIZES
+        except ImportError:
+            return False
+        return world_size in SUPPORTED_WORLD_SIZES
+
+    @staticmethod
+    def init_quick_reduce_scatter(
+        *, group: Any, rank: int, world_size: int, max_size: int
+    ) -> int:
+        """Create an AITER QuickReduce communicator for `qr_reduce_scatter`."""
+        import aiter
+        from aiter.dist.device_communicators.quick_all_reduce import (
+            qr_exchange_handles,
+        )
+
+        handle = aiter.init_custom_qr(rank, world_size, max_size)
+        qr_exchange_handles(handle, world_size, group)
+        return handle
+
+    @staticmethod
+    def quick_reduce_scatter(
+        handle: int, inp: torch.Tensor, out: torch.Tensor, cast_bf2half: bool
+    ) -> None:
+        from aiter.ops.quick_reduce_scatter import qr_reduce_scatter
+
+        qr_reduce_scatter(handle, inp, out, cast_bf2half)
+
+    @staticmethod
+    def destroy_quick_reduce_scatter(handle: int) -> None:
+        import aiter
+
+        aiter.qr_destroy(handle)
+
+    @classmethod
+    @if_aiter_supported
     def is_shuffle_kv_cache_enabled(cls) -> bool:
         return cls._SHUFFLE_KV_CACHE_ENABLED
 

@@ -479,6 +479,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return ca_comm.custom_all_gather(input_.contiguous())
 
     def custom_reduce_scatter(self, input_: torch.Tensor) -> torch.Tensor | None:
+        qr_comm = self.qr_comm
+        if qr_comm is not None and qr_comm.should_quick_reduce_scatter(input_):
+            return qr_comm.quick_reduce_scatter(input_)
         ca_comm = self.ca_comm
         if ca_comm is None:
             return None

@@ -80,6 +80,8 @@ def _make_quick_allreduce_for_test(
 ) -> QuickAllReduce:
     quick_reduce = QuickAllReduce.__new__(QuickAllReduce)
     quick_reduce._flydsl_int4 = None
+    quick_reduce._rs_handle = None
+    quick_reduce._rs_max_size = 0
     quick_reduce.disabled = False
     quick_reduce.qr_max_size = 16 * MB
     quick_reduce.qr_min_size = min_size_mb * MB if min_size_mb is not None else None
@@ -149,6 +151,47 @@ def test_close_closes_flydsl_int4():
 
     assert fake.closed
     assert quick_reduce._flydsl_int4 is None
+
+
+@pytest.mark.parametrize(
+    "inp, expected",
+    [
+        pytest.param(torch.empty(8, 1024, dtype=torch.bfloat16), True, id="bf16"),
+        pytest.param(torch.empty(8, 1024, dtype=torch.float16), True, id="fp16"),
+        pytest.param(torch.empty(8, 1024), False, id="fp32"),
+        pytest.param(torch.empty(7, 1024, dtype=torch.bfloat16), False, id="ragged"),
+        pytest.param(
+            torch.empty(1024, 16, dtype=torch.bfloat16).t(), False, id="strided"
+        ),
+        pytest.param(torch.empty(2, 4, dtype=torch.bfloat16), False, id="unaligned"),
+        pytest.param(torch.empty(16 * MB, dtype=torch.bfloat16), False, id="above_max"),
+    ],
+)
+def test_should_quick_reduce_scatter(inp: torch.Tensor, expected: bool):
+    """The INT4 reduce-scatter takes only the shapes AITER's kernel accepts."""
+    quick_reduce = _make_quick_allreduce_for_test()
+    assert not quick_reduce.should_quick_reduce_scatter(inp)
+
+    quick_reduce._rs_handle = 1
+    quick_reduce._rs_max_size = 16 * MB
+    eligible = quick_reduce.should_quick_reduce_scatter(inp)
+    quick_reduce._rs_handle = None  # not a real communicator to destroy
+    assert eligible == expected
+
+
+def test_close_destroys_quick_reduce_scatter(monkeypatch: pytest.MonkeyPatch):
+    quick_reduce = _make_quick_allreduce_for_test()
+    quick_reduce.disabled = True  # skip the HIP teardown
+    quick_reduce._rs_handle = 7
+    destroyed: list[int] = []
+    monkeypatch.setattr(
+        aiter_ops.rocm_aiter_ops, "destroy_quick_reduce_scatter", destroyed.append
+    )
+
+    quick_reduce.close()
+
+    assert destroyed == [7]
+    assert quick_reduce._rs_handle is None
 
 
 def test_should_quick_allreduce_uses_builtin_min_size_when_unset():
@@ -630,6 +673,78 @@ def test_custom_quick_allreduce_bf16_cast(monkeypatch: pytest.MonkeyPatch):
         pytest.skip("Not enough GPUs to run the test.")
     monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "FP")
     multi_process_parallel(monkeypatch, 2, 1, bf16_cast_quickreduce)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def quick_reduce_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size,
+    pp_size,
+    rank,
+    distributed_init_port,
+):
+    from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
+
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
+        m.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+        fa = get_tp_group().device_communicator.qr_comm
+        assert fa._rs_handle is not None
+
+        hidden = 7168
+        for num_tokens in (1024 * tp_size, 1024 * tp_size + 3):
+            for dtype in (torch.float16, torch.bfloat16):
+                gen = torch.Generator(device=device).manual_seed(num_tokens)
+                inputs = [
+                    torch.randint(
+                        -23, 23, (num_tokens, hidden), generator=gen, device=device
+                    ).to(dtype)
+                    for _ in range(tp_size)
+                ]
+                shard = -(-num_tokens // tp_size)
+                ref = torch.stack(inputs).float().sum(0)
+                ref = torch.nn.functional.pad(
+                    ref, (0, 0, 0, shard * tp_size - num_tokens)
+                )
+                ref = ref[rank * shard : (rank + 1) * shard]
+
+                out = sp_reduce_scatter(inputs[rank])
+                # INT4 codec error, as in AITER's QuickReduce tests.
+                rel_l2 = (out.float() - ref).norm() / ref.norm()
+                assert rel_l2 < 0.12, (num_tokens, dtype, rel_l2)
+
+                graph = torch.cuda.CUDAGraph()
+                with (
+                    graph_capture(device=device) as ctx,
+                    torch.cuda.graph(graph, stream=ctx.stream),
+                ):
+                    graph_out = sp_reduce_scatter(inputs[rank])
+                graph.replay()
+                torch.testing.assert_close(graph_out, out, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="only test quick reduce for rocm"
+)
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_quick_reduce_scatter(monkeypatch: pytest.MonkeyPatch, tp_size):
+    """`sp_reduce_scatter` takes the INT4 QuickReduce reduce-scatter, eager
+    and in a CUDA graph, for row counts that do and do not split evenly."""
+    if tp_size > torch.accelerator.device_count():
+        pytest.skip("Not enough GPUs to run the test.")
+    try:
+        from aiter.ops.quick_reduce_scatter import SUPPORTED_WORLD_SIZES
+    except ImportError:
+        SUPPORTED_WORLD_SIZES = ()
+    if tp_size not in SUPPORTED_WORLD_SIZES:
+        pytest.skip("AITER has no QuickReduce reduce-scatter for this world size.")
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+    monkeypatch.setenv("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
+    multi_process_parallel(monkeypatch, tp_size, 1, quick_reduce_scatter)
 
 
 def qr_variable_input(rank, world_size):

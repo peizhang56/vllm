@@ -15,6 +15,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -91,6 +92,8 @@ class QuickAllReduce:
         """
         self.disabled = True
         self._flydsl_int4: Any = None
+        self._rs_handle: int | None = None
+        self._rs_max_size = 0
         if not self._rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -260,6 +263,7 @@ class QuickAllReduce:
             )
         self.create_shared_buffer()
         self._flydsl_int4 = self._init_flydsl_int4(vllm_config)
+        self._init_reduce_scatter(vllm_config)
         self.disabled = False
 
     def _init_flydsl_int4(self, vllm_config) -> Any:
@@ -387,6 +391,68 @@ class QuickAllReduce:
         )
         return out
 
+    def _init_reduce_scatter(self, vllm_config) -> None:
+        """Set up AITER's INT4 QuickReduce reduce-scatter.
+
+        It runs on its own AITER communicator, whose IPC buffer is sized for
+        the largest reduce-scatter a step can issue: `max_num_batched_tokens`
+        rows of the model's hidden size.
+        """
+        if (
+            self.qr_quant_level != QuickReduceRegime.INT4
+            or not rocm_aiter_ops.is_quick_reduce_scatter_available(self.world_size)
+        ):
+            return
+        max_size = self.qr_max_size
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is not None:
+            max_rows = round_up(
+                vllm_config.scheduler_config.max_num_batched_tokens, self.world_size
+            )
+            max_size = min(
+                max_size,
+                max_rows * model_config.get_hidden_size() * model_config.dtype.itemsize,
+            )
+        self._rs_handle = rocm_aiter_ops.init_quick_reduce_scatter(
+            group=self.group,
+            rank=self.rank,
+            world_size=self.world_size,
+            max_size=max_size,
+        )
+        self._rs_max_size = max_size
+        logger.info(
+            "Custom quick allreduce: INT4 reduce-scatter enabled, max size = %d MB",
+            max_size // MB,
+        )
+
+    @property
+    def supports_reduce_scatter(self) -> bool:
+        """Whether `quick_reduce_scatter` is set up for this group."""
+        return self._rs_handle is not None and not self.disabled
+
+    def should_quick_reduce_scatter(self, inp: torch.Tensor) -> bool:
+        """Whether `quick_reduce_scatter` takes `inp` (split along dim 0)."""
+        if not self.supports_reduce_scatter:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        return (
+            inp.dtype in self._SUPPORTED_DTYPES
+            and inp.dim() > 0
+            and inp.shape[0] % self.world_size == 0
+            and inp.is_contiguous()
+            and inp_size % (16 * self.world_size) == 0
+            and 0 < inp_size <= self._rs_max_size
+        )
+
+    def quick_reduce_scatter(self, inp: torch.Tensor) -> torch.Tensor:
+        """Reduce-scatter `inp` along dim 0 with the INT4 codec."""
+        assert self._rs_handle is not None
+        out = inp.new_empty((inp.shape[0] // self.world_size, *inp.shape[1:]))
+        rocm_aiter_ops.quick_reduce_scatter(
+            self._rs_handle, inp, out, self.use_fp16_kernels
+        )
+        return out
+
     def _use_flydsl_int4(self, inp: torch.Tensor) -> bool:
         return (
             self._flydsl_int4 is not None
@@ -410,6 +476,9 @@ class QuickAllReduce:
         return self.qr_quant_level.value
 
     def close(self):
+        if self._rs_handle is not None:
+            rocm_aiter_ops.destroy_quick_reduce_scatter(self._rs_handle)
+            self._rs_handle = None
         if self._flydsl_int4 is not None:
             self._flydsl_int4.close()
             self._flydsl_int4 = None
