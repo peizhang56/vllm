@@ -119,6 +119,17 @@ class AttentionConfig:
     ignored with a warning where it does not apply. It pays off from about 4
     concurrent decodes at 128K context and grows with batch and context."""
 
+    indexer_decode_row_shard: bool = True
+    """Under tensor parallelism, split the sparse-attention indexer's decode rows
+    across the TP ranks: each rank computes the logits and top-k of 1/TP of the
+    rows and the ranks all-gather the top-k, instead of every rank scoring every
+    row. The result is the same apart from ties at the top-k cut. Implemented for
+    the DeepSeek-V4 indexer on ROCm, for decode steps of at least 65 rows with
+    one query each, without PCP or DCP. Its saving grows with batch and
+    context; at contexts of a few thousand tokens the exchange can cost more
+    than it saves (up to about 20 us per index layer), so short-context serving
+    may turn it off."""
+
     indexer_sparse_logits: bool | None = None
     """Score only candidate blocks in the DeepSeek V4.1 two-level indexer.
     None (default) enables it on SM90 and supported SM100 configurations;

@@ -13,13 +13,16 @@ import torch.nn.functional as F
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
-from vllm.distributed.parallel_state import get_pcp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepSeekV32IndexerDecodeMetadata,
+    DeepseekV32IndexerMetadata,
+)
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.mxfp4_mla.read import load_mxfp4_rows
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
@@ -47,6 +50,9 @@ logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 _USE_FUSED_PAGED_MQA_LOGITS = _ON_GFX942 or _ON_GFX950 or _ON_RDNA
+# Smallest decode step whose indexer rows are split across TP ranks. Below it
+# the top-k all-gather costs more than the scoring it saves.
+_DECODE_ROW_SHARD_MIN_ROWS = 65
 
 
 def _decode_logits_workspace(num_rows: int, max_model_len: int) -> torch.Tensor:
@@ -1372,6 +1378,7 @@ def rocm_aiter_sparse_attn_indexer_fake(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_interleave: int = 1,
+    decode_row_shard: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -1402,6 +1409,7 @@ def rocm_aiter_sparse_attn_indexer(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_interleave: int = 1,
+    decode_row_shard: bool = False,
 ) -> torch.Tensor:
     from vllm._aiter_ops import rocm_aiter_ops
     from vllm.model_executor.layers.sparse_attn_indexer import _merge_dcp_topk_global
@@ -1493,7 +1501,22 @@ def rocm_aiter_sparse_attn_indexer(
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    shard_decode_rows = (
+        decode_row_shard
+        and has_decode
+        and _decode_row_shard_applies(
+            layer_attn_metadata, compress_ratio, candidate_blocks, use_pcp
+        )
+    )
+    if (
+        shard_decode_rows
+        and not has_prefill
+        and topk_tokens == topk_indices_buffer.shape[1]
+    ):
+        # The decode top-k exchange writes every entry of the decode rows.
+        topk_indices_buffer[num_decode_tokens : hidden_states.shape[0]] = -1
+    else:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
@@ -1681,6 +1704,28 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
+        # FULL graphs are not keyed by context length, so use a replay-safe
+        # upper bound when choosing the captured kernel.
+        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            max_compressed_seq_len = decode_max_model_len
+        else:
+            max_compressed_seq_len = layer_attn_metadata.max_seq_len // compress_ratio
+
+        if shard_decode_rows:
+            _decode_row_shard_topk(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights,
+                decode_metadata,
+                decode_max_model_len,
+                max_compressed_seq_len,
+                compress_ratio,
+                cache_layout,
+                topk_tokens,
+                topk_indices_buffer,
+            )
+            return topk_indices_buffer
+
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -1727,43 +1772,15 @@ def rocm_aiter_sparse_attn_indexer(
                 )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-        num_rows = logits.shape[0]
-
-        # FULL graphs are not keyed by context length, so use a replay-safe
-        # upper bound when choosing the captured kernel.
-        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            max_compressed_seq_len = decode_max_model_len
-        else:
-            max_compressed_seq_len = layer_attn_metadata.max_seq_len // compress_ratio
-        if rocm_aiter_ops.is_indexer_top_k_supported(
-            is_prefill=False,
-            compress_ratio=compress_ratio,
-            num_rows=num_rows,
-            max_valid_seq_len=max_compressed_seq_len,
-            topk_tokens=topk_tokens,
-        ) and not rocm_aiter_ops.dsv4_indexer_prefers_native_top_k(
-            num_rows=num_rows,
-            num_columns=logits.shape[1],
-            topk_tokens=topk_tokens,
-        ):
-            rocm_aiter_ops.indexer_top_k_decode(
-                logits,
-                1,
-                decode_metadata.seq_lens.reshape(-1),
-                topk_indices,
-                topk_tokens,
-            )
-        else:
-            torch.ops._C.top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+        _decode_top_k(
+            logits,
+            next_n,
+            decode_metadata.seq_lens,
+            topk_indices,
+            topk_tokens,
+            compress_ratio,
+            max_compressed_seq_len,
+        )
 
         _merge_dcp_topk_global(
             logits,
@@ -1785,6 +1802,141 @@ def rocm_aiter_sparse_attn_indexer(
             )
 
     return topk_indices_buffer
+
+
+def _decode_top_k(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    compress_ratio: int,
+    max_compressed_seq_len: int,
+) -> None:
+    """Write every entry of `topk_indices`: each row's top-k columns, padded
+    with -1 past a row shorter than `topk_tokens`."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    num_rows = logits.shape[0]
+    if rocm_aiter_ops.is_indexer_top_k_supported(
+        is_prefill=False,
+        compress_ratio=compress_ratio,
+        num_rows=num_rows,
+        max_valid_seq_len=max_compressed_seq_len,
+        topk_tokens=topk_tokens,
+    ) and not rocm_aiter_ops.dsv4_indexer_prefers_native_top_k(
+        num_rows=num_rows,
+        num_columns=logits.shape[1],
+        topk_tokens=topk_tokens,
+    ):
+        rocm_aiter_ops.indexer_top_k_decode(
+            logits,
+            1,
+            seq_lens.reshape(-1),
+            topk_indices,
+            topk_tokens,
+        )
+    else:
+        torch.ops._C.top_k_per_row_decode(
+            logits,
+            next_n,
+            seq_lens,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+
+
+def _decode_row_shard_applies(
+    metadata: DeepseekV32IndexerMetadata,
+    compress_ratio: int,
+    candidate_blocks: torch.Tensor | None,
+    use_pcp: bool,
+) -> bool:
+    """Whether TP ranks split this step's decode indexer rows.
+
+    Every input is the same on all TP ranks (the indexer query is replicated
+    and they share the step's metadata), so either all of them enter the
+    top-k all-gather or none does.
+    """
+    decode = metadata.decode
+    if (
+        decode is None
+        or decode.requires_padding
+        or candidate_blocks is not None
+        or use_pcp
+        # DeepSeek-V4 C4A (DCP is rejected above for it) with one query per
+        # decode row (plain decode, or MTP rows the builder flattened), so each
+        # row's logits and top-k depend on its own length and block table.
+        or not _indexer_k_is_c4a_block_flat(compress_ratio)
+        or metadata.num_decode_tokens != decode.decode_lens.shape[0]
+        or metadata.num_decode_tokens < _DECODE_ROW_SHARD_MIN_ROWS
+    ):
+        return False
+    return get_tp_group().world_size > 1
+
+
+def _decode_row_shard_topk(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    decode_metadata: DeepSeekV32IndexerDecodeMetadata,
+    max_model_len: int,
+    max_compressed_seq_len: int,
+    compress_ratio: int,
+    cache_layout: str | None,
+    topk_tokens: int,
+    topk_indices_buffer: torch.Tensor,
+) -> None:
+    """Score TP rank r's contiguous share of the decode rows, then all-gather
+    the int32 top-k into `topk_indices_buffer[:num_rows]`.
+
+    Shapes depend only on the row count and the TP size, so the step can be
+    captured in a FULL CUDA graph.
+    """
+    from vllm.utils.math_utils import cdiv
+
+    tp = get_tp_group()
+    num_rows = q.shape[0]
+    rows_per_rank = cdiv(num_rows, tp.world_size)
+    start = min(tp.rank_in_group * rows_per_rank, num_rows)
+    end = min(start + rows_per_rank, num_rows)
+    logger.debug_once(
+        "Splitting %d sparse-indexer decode rows across %d TP ranks.",
+        num_rows,
+        tp.world_size,
+    )
+    # Local rows past `end` only pad the last shares to a uniform all-gather;
+    # they land past `num_rows` and are dropped.
+    local_topk = torch.empty(
+        (rows_per_rank, topk_tokens), dtype=torch.int32, device=q.device
+    )
+    if end > start:
+        seq_lens = decode_metadata.seq_lens.reshape(-1)[start:end]
+        logits = rocm_fp8_paged_mqa_logits(
+            q[start:end],
+            kv_cache,
+            weights[start:end],
+            seq_lens,
+            decode_metadata.block_table[start:end],
+            decode_metadata.schedule_metadata,
+            max_model_len=max_model_len,
+            compress_ratio=compress_ratio,
+            cache_layout=cache_layout,
+        )
+        _decode_top_k(
+            logits,
+            1,
+            seq_lens,
+            local_topk[: end - start],
+            topk_tokens,
+            compress_ratio,
+            max_compressed_seq_len,
+        )
+    gathered = tp.all_gather(local_topk, dim=0)
+    topk_indices_buffer[:num_rows, :topk_tokens] = gathered[:num_rows]
 
 
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:

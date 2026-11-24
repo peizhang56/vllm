@@ -1406,6 +1406,7 @@ class SparseAttnIndexer(CustomOp):
         self.logits_dtype = STR_DTYPE_TO_TORCH_DTYPE[
             vllm_config.attention_config.resolve_indexer_logits_dtype("float32")
         ]
+        self.decode_row_shard = vllm_config.attention_config.indexer_decode_row_shard
         self._parallel_config = parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
@@ -1580,6 +1581,7 @@ class SparseAttnIndexer(CustomOp):
                 dcp_rank=self.dcp_rank,
                 dcp_world_size=self.dcp_world_size,
                 cp_interleave=self._parallel_config.cp_kv_cache_interleave_size,
+                decode_row_shard=self.decode_row_shard,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path requires AITER or a supported "
