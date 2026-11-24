@@ -101,9 +101,8 @@ def test_packed_dsv4_zeroer_zeroes_only_each_layers_page():
 
 
 def test_overlaid_zeroer_dedups_segments_with_max_span():
-    """Two groups overlay one allocation; the zeroer must emit one segment per distinct
-    byte offset, spanning the widest overlaid page, so a newly allocated block is fully
-    zeroed no matter which group owns it."""
+    """Two groups overlay one allocation; the zeroer must zero the union of the overlaid
+    pages, so a newly allocated block is fully zeroed no matter which group owns it."""
     from unittest.mock import MagicMock
 
     from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
@@ -154,14 +153,11 @@ def test_overlaid_zeroer_dedups_segments_with_max_span():
     assert zeroer._meta is not None
     seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._meta
 
-    # g1.big and g2.huge overlay at offset 0 -> one segment with g2's wider
-    # span; g1.small keeps its own segment.
-    assert n_segs == 2
+    # g2.huge overlays both g1 pages -> one segment spanning g2.huge's page.
     pages = {n: s.page_size_bytes for n, s in (g1_specs | g2_specs).items()}
-    by_offset = {
-        a - buf_ptr: p * 4 for a, p in zip(seg_addrs.tolist(), seg_page_sizes.tolist())
-    }
-    assert by_offset[0] == max(pages["g1.big"], pages["g2.huge"])
-    assert by_offset[pages["g1.big"]] == pages["g1.small"]
+    assert pages["g2.huge"] >= pages["g1.big"] + pages["g1.small"]
+    assert n_segs == 1
+    assert seg_addrs.tolist() == [buf_ptr]
+    assert seg_page_sizes.tolist() == [pages["g2.huge"] // 4]
     packed_block_stride = max(sum(pages[n] for n in g) for g in (g1_specs, g2_specs))
     assert (seg_block_strides * 4 == packed_block_stride).all()

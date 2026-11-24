@@ -102,6 +102,47 @@ def _zero_kv_blocks_kernel(
     )
 
 
+# Launch grid dims y and z are limited to 65,535 programs.
+_MAX_GRID_DIM = 65535
+_ZERO_KV_MAX_BLOCK_SIZE = 1024
+
+
+def _coalesce_zero_segments(
+    seg_addrs: list[int], seg_block_strides: list[int], seg_page_sizes: list[int]
+) -> tuple[list[int], list[int], list[int]]:
+    """Replace zeroing segments by the union of their byte intervals.
+
+    Segments with the same block stride move together with the block ID, so for
+    every block the union of their translated pages is the translated union of
+    their pages: the returned table zeroes exactly the same bytes, and each byte
+    once per block stride. The union is cut into pieces no longer than the
+    widest page, so the table has no more segments (grid y) or chunks (grid z)
+    than the input; pieces too long for grid z are cut further.
+
+    Addresses are in bytes; block strides and page sizes are int32 elements.
+    """
+    max_piece = min(max(seg_page_sizes), _MAX_GRID_DIM * _ZERO_KV_MAX_BLOCK_SIZE)
+    intervals: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for addr, stride, page in zip(seg_addrs, seg_block_strides, seg_page_sizes):
+        intervals[stride].append((addr, addr + page * 4))
+    addrs: list[int] = []
+    strides: list[int] = []
+    pages: list[int] = []
+    for stride, spans in intervals.items():
+        merged: list[list[int]] = []
+        for start, end in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        for start, end in merged:
+            for piece in range(start, end, max_piece * 4):
+                addrs.append(piece)
+                strides.append(stride)
+                pages.append(min(max_piece, (end - piece) // 4))
+    return addrs, strides, pages
+
+
 class KVBlockZeroer:
     """Manages efficient zeroing of KV cache blocks via a Triton kernel.
 
@@ -144,10 +185,6 @@ class KVBlockZeroer:
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
-        # Overlaid layers (packed layouts) share a base address but may have
-        # different page sizes; keep the widest span per address so newly
-        # allocated blocks are fully zeroed for every overlaying group.
-        seen_ptrs: dict[int, int] = {}
         seg_addrs: list[int] = []
         seg_block_strides: list[int] = []
         seg_page_sizes: list[int] = []
@@ -200,16 +237,6 @@ class KVBlockZeroer:
                     assert (dp + off_bytes) % 4 == 0
                     for virtual_index in range(ratio):
                         addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
-                            assert (
-                                seg_block_strides[idx]
-                                == logical_block_stride_bytes // 4
-                            )
-                            seg_page_sizes[idx] = max(
-                                seg_page_sizes[idx], kernel_page_bytes // 4
-                            )
-                            continue
-                        seen_ptrs[addr] = len(seg_addrs)
                         seg_addrs.append(addr)
                         seg_block_strides.append(logical_block_stride_bytes // 4)
                         seg_page_sizes.append(kernel_page_bytes // 4)
@@ -218,8 +245,21 @@ class KVBlockZeroer:
             self._meta = None
             return
 
+        # Overlaid layers (packed layouts) and pages that span the block's other
+        # layers (block-major layouts) overlap; zero each byte once.
+        num_views = len(seg_addrs)
+        seg_addrs, seg_block_strides, seg_page_sizes = _coalesce_zero_segments(
+            seg_addrs, seg_block_strides, seg_page_sizes
+        )
+        logger.debug(
+            "KV block zeroer: %d layer view segments -> %d segments",
+            num_views,
+            len(seg_addrs),
+        )
         max_page_size_el = max(seg_page_sizes)
-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
+        blk_size = min(
+            1 << (max_page_size_el - 1).bit_length(), _ZERO_KV_MAX_BLOCK_SIZE
+        )
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
