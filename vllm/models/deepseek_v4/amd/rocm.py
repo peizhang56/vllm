@@ -1499,7 +1499,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             )
             zf = z.flatten(1)
         if self._wo_b_scale is not None and zf.dim() == 2:
-            return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
+            return self._bpre_attn_gemm(
+                self.wo_b.weight, self._wo_b_scale, zf, self.wo_b.reduce_results
+            )
         return self.wo_b(zf)
 
     def forward_mqa(

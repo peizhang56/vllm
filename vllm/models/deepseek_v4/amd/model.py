@@ -18,6 +18,8 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.mxfp8.aiter_flydsl import (
@@ -90,6 +92,12 @@ from vllm.model_executor.utils import (
     is_weights_pre_processed,
     refill_derived,
     replace_parameter,
+)
+from vllm.models.common.ops.sequence_parallel import (
+    is_sequence_parallel_active,
+    sp_all_gather,
+    sp_reduce_scatter,
+    sp_shard,
 )
 from vllm.models.deepseek_v4.amd.mega_moe import (
     DeepseekV4AiterMegaMoEExperts,
@@ -651,6 +659,7 @@ class DeepseekV4MoE(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         fuse_heterogeneous_shared_expert: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
 
@@ -832,6 +841,7 @@ class DeepseekV4MoE(nn.Module):
             image_sentinel_lo=self.image_sentinel_lo,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
+            reduce_results=reduce_results,
             routed_experts_cls=(
                 DeepseekV4HeterogeneousSharedRoutedExperts
                 if self.fuse_heterogeneous_shared_expert
@@ -913,6 +923,35 @@ class DeepseekV4MoE(nn.Module):
 # Hidden sizes supported by AITER mhc_pre_big_fuse_rmsnorm.
 _AITER_MHC_FUSED_RMSNORM_SIZES = frozenset({1280, 2560, 4096, 7168})
 
+# Smallest step whose mHC rows are sharded; shorter ones keep them replicated.
+_SP_MIN_TOKENS = 1024
+
+
+def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    """Whether large steps run mHC sequence-parallel.
+
+    Each sub-layer's partial sum is reduce-scattered instead of all-reduced,
+    each rank runs mHC on its own rows, and the next sub-layer's input is
+    all-gathered. That pays only with a reduce-scatter faster than RCCL's, so
+    it follows the TP group's INT4 QuickReduce reduce-scatter.
+    """
+    parallel_config = vllm_config.parallel_config
+    if (
+        parallel_config.tensor_parallel_size == 1
+        or parallel_config.data_parallel_size > 1
+        or parallel_config.pipeline_parallel_size > 1
+        or parallel_config.prefill_context_parallel_size > 1
+        or parallel_config.decode_context_parallel_size > 1
+        or parallel_config.enable_expert_parallel
+        or parallel_config.use_ubatching
+        or vllm_config.kernel_config.moe_backend == "aiter_mega_moe"
+        or vllm_config.lora_config is not None
+        or envs.VLLM_BATCH_INVARIANT
+    ):
+        return False
+    qr_comm = getattr(get_tp_group().device_communicator, "qr_comm", None)
+    return qr_comm is not None and qr_comm.supports_reduce_scatter
+
 
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
@@ -922,6 +961,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         fuse_heterogeneous_shared_expert: bool = False,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
 
@@ -939,10 +979,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
+        # Under sequence parallelism the layer reduces each sub-layer itself:
+        # a reduce-scatter on sharded steps, an all-reduce otherwise.
+        self.defer_reduction = sequence_parallel
+        if self.defer_reduction:
+            self.attn.wo_b.reduce_results = False
         self.ffn = DeepseekV4MoE(
             vllm_config,
             prefix=f"{prefix}.ffn",
             fuse_heterogeneous_shared_expert=fuse_heterogeneous_shared_expert,
+            reduce_results=not self.defer_reduction,
         )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1050,6 +1096,18 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         return self.mhc_post(x, residual, post, comb)
 
+    def _gather(self, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        if x.shape[0] == num_tokens:
+            return x
+        return sp_all_gather(x)[:num_tokens]
+
+    def _reduce(self, x: torch.Tensor, sharded: bool) -> torch.Tensor:
+        if not self.defer_reduction:
+            return x
+        if sharded:
+            return sp_reduce_scatter(x)
+        return tensor_model_parallel_all_reduce(x)
+
     def _forward_fused_post_pre(
         self,
         x: torch.Tensor,
@@ -1094,7 +1152,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not self.fuse_mhc_rmsnorm:
             x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        sharded = x.shape[0] != positions.shape[0]
+        x = self.attn(positions, self._gather(x, positions.shape[0]), None)
+        x = self._reduce(x, sharded)
 
         ffn_norm_weight = self.ffn_norm.weight if self.fuse_mhc_rmsnorm else None
         ffn_norm_eps = self.ffn_norm.variance_epsilon if self.fuse_mhc_rmsnorm else 0.0
@@ -1116,7 +1176,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if not self.fuse_mhc_rmsnorm:
             x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        x = self.ffn(self._gather(x, positions.shape[0]), input_ids)
+        x = self._reduce(x, sharded)
         return x, residual, post_mix, res_mix
 
     def _forward_unfused_post_pre(
@@ -1135,16 +1196,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
-        x = self.hc_post(x, residual, post, comb)
+        sharded = x.shape[0] != positions.shape[0]
+        x = self.attn(positions, self._gather(x, positions.shape[0]), None)
+        x = self.hc_post(self._reduce(x, sharded), residual, post, comb)
 
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
+        x = self.ffn(self._gather(x, positions.shape[0]), input_ids)
+        x = self.hc_post(self._reduce(x, sharded), residual, post, comb)
         return x, None, None, None
 
     def forward(
@@ -1158,7 +1220,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
-        if self.mono is not None:
+        if self.mono is not None and x.shape[0] == positions.shape[0]:
             out = self.mono(self, x, positions, input_ids, post_mix, res_mix, residual)
             if out is not None:
                 return out
@@ -1209,6 +1271,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             vllm_config
         )
         self.use_mega_moe = vllm_config.kernel_config.moe_backend == "aiter_mega_moe"
+        self.sequence_parallel = _use_sequence_parallel(vllm_config)
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -1219,6 +1282,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 fuse_heterogeneous_shared_expert=(
                     self.fuse_heterogeneous_shared_expert
                 ),
+                sequence_parallel=self.sequence_parallel,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1304,6 +1368,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        num_tokens = positions.shape[0]
+        sharded = is_sequence_parallel_active(
+            self.sequence_parallel, num_tokens, _SP_MIN_TOKENS
+        )
+        if sharded:
+            hidden_states = sp_shard(hidden_states)
+
         residual, post_mix, res_mix = None, None, None
         # EAGLE3 / DSpark / DFlash aux hidden states: reconstructed (post-mhc)
         # hidden state at the configured target layers, averaged over the
@@ -1337,7 +1408,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     final_aux_recon = aux_recon
                 else:
                     aux_recon = hidden_states
-                aux_hidden_states.append(aux_recon.mean(dim=1))
+                aux_hidden_state = aux_recon.mean(dim=1)
+                if sharded:
+                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:num_tokens]
+                aux_hidden_states.append(aux_hidden_state)
         if layer is not None and layer.use_fused_mhc:
             # Reuse the last layer's hc_post output if it was already computed
             # for the aux hidden state above; otherwise compute it now.
@@ -1350,6 +1424,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = layer.hc_post(
                     hidden_states, residual, post_mix, res_mix
                 )
+        if sharded:
+            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
