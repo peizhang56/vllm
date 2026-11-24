@@ -31,6 +31,10 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_kernel_dispatcher_with_warmup,
 )
+from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
+    sp_fp8_form,
+    sp_fp8_handoff_check,
+)
 from vllm.models.deepseek_v4.attention import (
     DeepseekV4Attention,
     DeepseekV4Indexer,
@@ -930,6 +934,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
+    # Set by the decoder layer around a sequence-parallel step (dsv4_seq_parallel):
+    # return wo_b's TP partial sum; the caller reduce-scatters it.
+    _sp_defer_reduce = False
 
     def _get_indexer_cls(self, vllm_config: VllmConfig) -> type[DeepseekV4Indexer]:
         if dsa_indexer_uses_fp4(vllm_config):
@@ -1365,6 +1372,28 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._wqa_wkv_scale is not None and hidden_states.dim() == 2:
+            form = sp_fp8_form(hidden_states)
+            if form is not None:
+                # dsv4_seq_parallel: the layer-input gather's fp8 codes and
+                # scales, bitwise the per-1x128 requant _bpre_attn_gemm does.
+                from vllm._aiter_ops import rocm_aiter_ops
+
+                out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                    form[0],
+                    self.fused_wqa_wkv.weight,
+                    form[1],
+                    self._wqa_wkv_scale,
+                    output_dtype=hidden_states.dtype,
+                )
+                sp_fp8_handoff_check(
+                    "fused_wqa_wkv",
+                    hidden_states,
+                    out,
+                    lambda x: self._bpre_attn_gemm(
+                        self.fused_wqa_wkv.weight, self._wqa_wkv_scale, x, False
+                    ),
+                )
+                return out
             return self._bpre_attn_gemm(
                 self.fused_wqa_wkv.weight, self._wqa_wkv_scale, hidden_states, False
             )
@@ -1502,8 +1531,14 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 inverse_rope=False,
             )
             zf = z.flatten(1)
+        # Sequence-parallel steps reduce-scatter the partial sum themselves.
+        reduce_tp = not self._sp_defer_reduce
         if self._wo_b_scale is not None and zf.dim() == 2:
-            return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
+            return self._bpre_attn_gemm(
+                self.wo_b.weight, self._wo_b_scale, zf, reduce_tp
+            )
+        if not reduce_tp:
+            raise RuntimeError("sequence-parallel attention needs the preshuffled wo_b")
         return self.wo_b(zf)
 
     def forward_mqa(

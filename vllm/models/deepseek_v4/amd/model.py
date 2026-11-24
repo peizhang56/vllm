@@ -97,6 +97,17 @@ from vllm.models.deepseek_v4.amd.mega_moe import (
 )
 from vllm.models.deepseek_v4.amd.mono_decode import MonoDecodeLayer
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
+from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
+    SEQ_PARALLEL_LABEL,
+    SEQ_PARALLEL_MIN_ROWS,
+    SeqParallelSeamComm,
+    SeqParallelStep,
+    set_sp_self_check,
+    sp_config_disable_reasons,
+    sp_fp8_form,
+    sp_fp8_handoff_check,
+    sp_fp8_handoff_clear,
+)
 from vllm.models.deepseek_v4.amd.silu_and_mul_mxfp8 import silu_and_mul_mxfp8
 from vllm.models.deepseek_v4.common.spec_decode import needs_mtp_hidden_buffer
 from vllm.models.deepseek_v4.compressor import dsv4_swa_replay_enabled
@@ -229,17 +240,33 @@ class DeepseekV4MLP(nn.Module):
         # this module), refilled in place on reloads for captured CUDA graphs.
         refill_derived(self, "_gateup_scale", ws.detach())
 
+    def _gateup_requant(self, x: torch.Tensor) -> torch.Tensor:
+        # gate_up via fp8 group-quant (col-major) + B-preshuffle GEMM.
+        x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
+        return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            x_fp8,
+            self.gate_up_proj.weight,
+            x_scale,
+            self._gateup_scale,
+            output_dtype=x.dtype,
+        )
+
     def forward(self, x):
         if self._gateup_scale is not None and x.dim() == 2:
-            # gate_up via fp8 group-quant (col-major) + B-preshuffle GEMM.
-            x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
-            gate_up = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
-                x_fp8,
-                self.gate_up_proj.weight,
-                x_scale,
-                self._gateup_scale,
-                output_dtype=x.dtype,
-            )
+            form = sp_fp8_form(x)
+            if form is not None:
+                # dsv4_seq_parallel: the layer-input gather's fp8 codes and
+                # scales, bitwise the requant _gateup_requant does.
+                gate_up = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                    form[0],
+                    self.gate_up_proj.weight,
+                    form[1],
+                    self._gateup_scale,
+                    output_dtype=x.dtype,
+                )
+                sp_fp8_handoff_check("shared_gate_up", x, gate_up, self._gateup_requant)
+            else:
+                gate_up = self._gateup_requant(x)
         else:
             # The fused mHC seam may hand over x already quantized to MXFP8.
             qa = mxfp8_input(x)
@@ -867,6 +894,21 @@ class DeepseekV4MoE(nn.Module):
 
         return final_hidden_states.view(org_shape)
 
+    def forward_partial(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
+    ) -> torch.Tensor:
+        """forward() without the final TP all-reduce: this rank's partial sum
+        (routed + shared), which sequence-parallel steps reduce-scatter."""
+        if self.use_mega_moe:
+            raise RuntimeError("sequence-parallel MoE does not support aiter_mega_moe")
+        cfg = self.experts.moe_config
+        prev = cfg.skip_final_all_reduce
+        cfg.skip_final_all_reduce = True
+        try:
+            return self.forward(hidden_states, input_ids)
+        finally:
+            cfg.skip_final_all_reduce = prev
+
     def _forward_mega_moe(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
     ) -> torch.Tensor:
@@ -1120,6 +1162,97 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
+    def forward_seq_parallel(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        sp: SeqParallelStep,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """_forward_fused_post_pre with the mHC seams on this rank's Mp/8 rows.
+
+        Each sublayer's partial sum (attention wo_b, MoE routed + shared) is
+        reduce-scattered, the fused post+pre seam runs on Mp/8 rows, and the
+        next sublayer's input is all-gathered in fp8 1x128. x, residual,
+        post_mix and res_mix stay on Mp/8 rows between layers; the first
+        layer's standalone pre seam runs on all rows and its outputs are
+        sliced. Returns the reduced FFN output rows.
+        """
+        fold = self.fuse_mhc_rmsnorm
+        attn_norm_weight = self.attn_norm.weight if fold else None
+        attn_norm_eps = self.attn_norm.variance_epsilon if fold else 0.0
+        if residual is None:
+            full_residual = x
+            x, post_mix, res_mix = self.hc_pre(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                norm_weight=attn_norm_weight,
+                norm_eps=attn_norm_eps,
+            )
+            residual = sp.rows(full_residual)
+            post_mix = sp.rows(post_mix)
+            res_mix = sp.rows(res_mix)
+        else:
+            residual, post_mix, res_mix, xs = self.mhc_fused_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                norm_weight=attn_norm_weight,
+                norm_eps=attn_norm_eps,
+            )
+            x = sp.gather(xs)
+        if not fold:
+            x = self.attn_norm(x)
+        self.attn._sp_defer_reduce = True
+        try:
+            a = self.attn(positions, x, None)
+        finally:
+            self.attn._sp_defer_reduce = False
+            sp_fp8_handoff_clear()
+        x = sp.reduce_scatter(a)
+
+        ffn_norm_weight = self.ffn_norm.weight if fold else None
+        ffn_norm_eps = self.ffn_norm.variance_epsilon if fold else 0.0
+        residual, post_mix, res_mix, xs = self.mhc_fused_post_pre(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            norm_weight=ffn_norm_weight,
+            norm_eps=ffn_norm_eps,
+        )
+        x = sp.gather(xs)
+        if not fold:
+            x = self.ffn_norm(x)
+        try:
+            f = self.ffn.forward_partial(x, input_ids)
+        finally:
+            sp_fp8_handoff_clear()
+        x = sp.reduce_scatter(f)
+        return x, residual, post_mix, res_mix
+
     def _forward_unfused_post_pre(
         self,
         x: torch.Tensor,
@@ -1264,6 +1397,67 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         else:
             self._mtp_hidden_buffer = None
+        self._init_seq_parallel(vllm_config)
+
+    def _init_seq_parallel(self, vllm_config: VllmConfig) -> None:
+        """Arm dsv4_seq_parallel if this deployment and model can run it."""
+        self._sp_enabled = vllm_config.attention_config.dsv4_seq_parallel
+        self._sp_comm: SeqParallelSeamComm | None = None
+        self._sp_logged = False
+        if not self._sp_enabled:
+            return
+        reasons = sp_config_disable_reasons(vllm_config)
+        if self.use_mega_moe:
+            reasons.append("aiter_mega_moe")
+        if any(
+            not layer.use_fused_mhc
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            reasons.append("unfused mHC")
+        if reasons:
+            logger.warning("%s ignored: %s", SEQ_PARALLEL_LABEL, ", ".join(reasons))
+            self._sp_enabled = False
+            return
+        set_sp_self_check(vllm_config.attention_config.dsv4_sp_self_check)
+        align = SeqParallelSeamComm.row_alignment(self.config.hidden_size)
+        mbt = vllm_config.scheduler_config.max_num_batched_tokens
+        self._sp_max_rows = (mbt + align - 1) // align * align
+        logger.info(
+            "%s: sequence-parallel mHC seams armed on rank %d (steps of %d..%d "
+            "rows; INT4 reduce-scatter, seams on M/8 rows, fp8 1x128 gather)",
+            SEQ_PARALLEL_LABEL,
+            get_tensor_model_parallel_rank(),
+            SEQ_PARALLEL_MIN_ROWS,
+            mbt,
+        )
+
+    def _seq_parallel_step(self, num_tokens: int) -> SeqParallelStep | None:
+        if not self._sp_enabled or num_tokens < SEQ_PARALLEL_MIN_ROWS:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        if not (get_pp_group().is_first_rank and get_pp_group().is_last_rank):
+            return None
+        if self._sp_comm is None:
+            from vllm.distributed import get_tp_group
+
+            self._sp_comm = SeqParallelSeamComm(
+                get_tp_group(), self._sp_max_rows, self.config.hidden_size
+            )
+        sp = SeqParallelStep(self._sp_comm, num_tokens)
+        if sp.mp > self._sp_max_rows:
+            return None
+        if not self._sp_logged:
+            self._sp_logged = True
+            logger.info(
+                "%s: sequence-parallel step dispatched on rank %d (%d rows -> %d "
+                "per rank)",
+                SEQ_PARALLEL_LABEL,
+                sp.comm.rank,
+                num_tokens,
+                sp.s,
+            )
+        return sp
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1315,6 +1509,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (avoids computing hc_post twice when the last layer is also an aux
         # layer).
         final_aux_recon: torch.Tensor | None = None
+        sp = self._seq_parallel_step(hidden_states.shape[0])
+        if sp is not None:
+            return self._forward_seq_parallel(hidden_states, positions, input_ids, sp)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1374,6 +1571,43 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def _forward_seq_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        sp: SeqParallelStep,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        residual, post_mix, res_mix = None, None, None
+        aux_hidden_states: list[torch.Tensor] = []
+        layer = None
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            hidden_states, residual, post_mix, res_mix = layer.forward_seq_parallel(
+                hidden_states, positions, input_ids, post_mix, res_mix, residual, sp
+            )
+            if (idx + 1) in self.aux_hidden_state_layers:
+                aux = layer.hc_post(hidden_states, residual, post_mix, res_mix)
+                aux_hidden_states.append(sp.gather_exact(aux.mean(dim=1)))
+        assert layer is not None
+        hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
+        # _mtp_hidden_buffer is not written: sp_config_disable_reasons allows
+        # only DSpark, which reads the aux hidden states.
+        hidden_states = self.hc_head_op(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+        )
+        hidden_states = sp.gather_exact(self.norm(hidden_states))
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

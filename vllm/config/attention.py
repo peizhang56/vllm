@@ -167,6 +167,19 @@ class AttentionConfig:
     indexer on gfx950. This shards indexer *work* and not the KV cache, so it
     is not `decode_context_parallel_size` and requires that to be 1."""
 
+    dsv4_seq_parallel: bool = False
+    """DeepSeek-V4 on ROCm gfx950 at TP8: on steps of at least 1024 rows, run
+    the mHC seams sequence-parallel. Each sublayer's partial sum is
+    reduce-scattered (AITER QuickReduce INT4) instead of all-reduced, the seam
+    runs on each rank's 1/8 of the rows, and the next sublayer's input is
+    all-gathered as fp8 with 1x128 scales. Ignored, with the reasons logged,
+    when the deployment cannot run it. No effect on other models."""
+
+    dsv4_sp_self_check: bool = False
+    """Debug only: one-time bitwise self-checks of the `dsv4_seq_parallel` fp8
+    handoff against the requantizing path. A check that fails on one rank
+    raises there while the other ranks wait in the next collective."""
+
     hisparse_config: HiSparseConfig | None = None
     """HiSparse host-resident KV configuration. Setting this enables experimental
     Model Runner V2-only HiSparse DSA and QSA decode hot-buffering. It is inferred
