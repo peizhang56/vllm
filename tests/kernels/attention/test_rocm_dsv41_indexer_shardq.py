@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ShardQ split of the ROCm FP8 sparse-indexer prefill (DeepSeek-V4.1).
+"""ShardQ split of the ROCm FP8 sparse-indexer prefill (DeepSeek-V4 and V4.1).
 
 One GPU plays every TP rank: each rank scores its zigzag tokens, which must
 select what the replicated run selects for them, including a candidate
@@ -73,9 +73,10 @@ def _cache(ratio: int):
     return ratio, q, weights, kv, tables, keys
 
 
-def _chunks(cache, tokens: np.ndarray):
+def _chunks(cache, tokens: np.ndarray, lead: int = 0):
     """The prefill chunks of `tokens` (ascending ids into all the rows),
-    numbered compactly, as the indexer builder chunks a ShardQ split."""
+    numbered compactly after `lead` rows, as the indexer builder chunks a
+    ShardQ split."""
     from vllm.v1.attention.backends.mla.indexer import (
         DeepseekV32IndexerPrefillChunkMetadata,
     )
@@ -83,7 +84,7 @@ def _chunks(cache, tokens: np.ndarray):
     ratio, _, _, _, tables, keys = cache
     starts = np.cumsum([0] + [new for _, new in REQUESTS])
     req = np.searchsorted(starts, tokens, side="right") - 1
-    chunks, row = [], 0
+    chunks, row = [], lead
     for lo, hi in CHUNKS:
         mine = (req >= lo) & (req < hi)
         cu = torch.tensor([0, *keys[lo:hi]], device="cuda").cumsum(0).int()
@@ -112,8 +113,10 @@ def _chunks(cache, tokens: np.ndarray):
     return chunks
 
 
-def _run(monkeypatch, cache, split=None, tokens=None, cand=None, write=False):
-    """One indexer layer over all the rows, or over a rank's ShardQ `tokens`."""
+def _run(monkeypatch, cache, split=None, tokens=None, cand=None, write=False, lead=0):
+    """One indexer layer over all the rows, or over a rank's ShardQ `tokens`,
+    behind `lead` rows the split leaves in place (the step's decodes, which
+    the layer does not score here)."""
     from vllm.config import CUDAGraphMode
     from vllm.v1.attention.backends.mla.indexer import (
         DeepseekV32IndexerMetadata,
@@ -122,8 +125,11 @@ def _run(monkeypatch, cache, split=None, tokens=None, cand=None, write=False):
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse
 
     ratio, q, weights, kv, _, _ = cache
-    indices = None if tokens is None else torch.from_numpy(tokens).cuda()
-    chunks = _chunks(cache, np.arange(ROWS) if tokens is None else tokens)
+    rows = lead + ROWS
+    indices = None
+    if tokens is not None:
+        indices = torch.from_numpy(np.r_[np.arange(lead), tokens + lead]).cuda()
+    chunks = _chunks(cache, np.arange(ROWS) if tokens is None else tokens, lead)
     metadata = DeepseekV32IndexerMetadata(
         seq_lens=torch.empty(0, device="cuda"),
         max_seq_len=0,
@@ -131,7 +137,7 @@ def _run(monkeypatch, cache, split=None, tokens=None, cand=None, write=False):
         num_decodes=0,
         num_decode_tokens=0,
         num_prefills=len(REQUESTS),
-        num_prefill_tokens=ROWS,
+        num_prefill_tokens=rows,
         prefill=DeepseekV32IndexerPrefillMetadata(
             chunks, shardq_gather_indices=indices, shardq_split=split
         ),
@@ -142,9 +148,9 @@ def _run(monkeypatch, cache, split=None, tokens=None, cand=None, write=False):
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
     )
     monkeypatch.setattr(rocm_aiter_mla_sparse, "get_forward_context", lambda: context)
-    out = torch.full((ROWS, TOPK), -7, dtype=torch.int32, device="cuda")
+    out = torch.full((rows, TOPK), -7, dtype=torch.int32, device="cuda")
     rocm_aiter_mla_sparse.rocm_aiter_sparse_attn_indexer(
-        torch.empty(ROWS, 1, device="cuda"),
+        torch.empty(rows, 1, device="cuda"),
         PREFIX,
         kv,
         q,
@@ -209,3 +215,43 @@ def test_shardq_split_matches_replicated(monkeypatch, world):
             assert torch.equal(sets(local), sets(want[mine]))
             assert torch.equal(sets(out), sets(want))
         assert torch.equal(sets(cand[: len(mine)]), sets(ref_cand[mine]))
+
+
+@pytest.mark.parametrize("world", [2, 8])
+def test_dsv4_shardq_split_matches_replicated(monkeypatch, world):
+    """DeepSeek-V4's ratio-4 layer behind rows the split leaves in place: each
+    rank's rows select what the replicated run selects, and the exchange puts
+    every row back in token order without touching the leading rows."""
+    from aiter import dtypes
+
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse
+    from vllm.v1.attention.ops.shardq import ShardQSplit, zigzag_split
+
+    def sets(t):
+        return t.sort(dim=-1).values
+
+    lead = 5
+    ratio, q, weights, *rest = _cache(4)
+    q = torch.cat((torch.randn(lead, HEADS, DIM, device="cuda").to(dtypes.fp8), q))
+    weights = torch.cat((torch.randn(lead, HEADS, device="cuda"), weights))
+    cache = (ratio, q, weights, *rest)
+    ref = _run(monkeypatch, cache, lead=lead)
+    assert (ref[:lead] == -1).all()
+    token_ids, counts = zigzag_split(np.array([new for _, new in REQUESTS]), world)
+    split = ShardQSplit(lead, token_ids, counts)
+    for rank in range(world):
+        start = counts[:rank].sum()
+        tokens = token_ids[start : start + counts[rank]]
+        gathered: list[torch.Tensor] = []
+
+        def all_gatherv(local, dim, sizes, gathered=gathered):
+            gathered.append(local.clone())
+            return ref[lead + torch.from_numpy(token_ids).cuda()]
+
+        group = SimpleNamespace(rank_in_group=rank, all_gatherv=all_gatherv)
+        monkeypatch.setattr(rocm_aiter_mla_sparse, "get_tp_group", lambda g=group: g)
+        out = _run(monkeypatch, cache, split, tokens, lead=lead)
+        (local,) = gathered
+        mine = lead + torch.from_numpy(tokens).cuda()
+        assert torch.equal(sets(local), sets(ref[mine]))
+        assert torch.equal(sets(out), sets(ref))
