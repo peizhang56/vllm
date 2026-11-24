@@ -113,10 +113,20 @@ def _chunks(cache, tokens: np.ndarray, lead: int = 0):
     return chunks
 
 
-def _run(monkeypatch, cache, split=None, tokens=None, cand=None, write=False, lead=0):
+def _run(
+    monkeypatch,
+    cache,
+    split=None,
+    tokens=None,
+    cand=None,
+    write=False,
+    lead=0,
+    compact=False,
+):
     """One indexer layer over all the rows, or over a rank's ShardQ `tokens`,
     behind `lead` rows the split leaves in place (the step's decodes, which
-    the layer does not score here)."""
+    the layer does not score here). `compact` passes the query and weights of
+    just the scored rows, as a caller building the compact query does."""
     from vllm.config import CUDAGraphMode
     from vllm.v1.attention.backends.mla.indexer import (
         DeepseekV32IndexerMetadata,
@@ -129,6 +139,8 @@ def _run(monkeypatch, cache, split=None, tokens=None, cand=None, write=False, le
     indices = None
     if tokens is not None:
         indices = torch.from_numpy(np.r_[np.arange(lead), tokens + lead]).cuda()
+        if compact:
+            q, weights = q[indices], weights[indices]
     chunks = _chunks(cache, np.arange(ROWS) if tokens is None else tokens, lead)
     metadata = DeepseekV32IndexerMetadata(
         seq_lens=torch.empty(0, device="cuda"),
@@ -218,10 +230,12 @@ def test_shardq_split_matches_replicated(monkeypatch, world):
 
 
 @pytest.mark.parametrize("world", [2, 8])
-def test_dsv4_shardq_split_matches_replicated(monkeypatch, world):
-    """DeepSeek-V4's ratio-4 layer behind rows the split leaves in place: each
-    rank's rows select what the replicated run selects, and the exchange puts
-    every row back in token order without touching the leading rows."""
+@pytest.mark.parametrize("compact", [False, True])
+def test_dsv4_shardq_split_matches_replicated(monkeypatch, world, compact):
+    """DeepSeek-V4's ratio-4 layer behind rows the split leaves in place, from
+    the full query or the compact one: each rank's rows select what the
+    replicated run selects, and the exchange puts every row back in token
+    order without touching the leading rows."""
     from aiter import dtypes
 
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse
@@ -250,8 +264,35 @@ def test_dsv4_shardq_split_matches_replicated(monkeypatch, world):
 
         group = SimpleNamespace(rank_in_group=rank, all_gatherv=all_gatherv)
         monkeypatch.setattr(rocm_aiter_mla_sparse, "get_tp_group", lambda g=group: g)
-        out = _run(monkeypatch, cache, split, tokens, lead=lead)
+        out = _run(monkeypatch, cache, split, tokens, lead=lead, compact=compact)
         (local,) = gathered
         mine = lead + torch.from_numpy(tokens).cuda()
         assert torch.equal(sets(local), sets(ref[mine]))
         assert torch.equal(sets(out), sets(ref))
+
+
+@pytest.mark.parametrize(
+    ("graph", "padded", "compact"),
+    [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_dsv4_compact_query_only_in_eager_steps(monkeypatch, graph, padded, compact):
+    """DeepSeek-V4 builds the query of just the rank's rows only in eager
+    steps without padded decode rows: a graph would bake the rows in, and the
+    op reads padded decode rows past the decode tokens."""
+    from vllm.config import CUDAGraphMode
+    from vllm.models.deepseek_v4 import attention
+
+    rows = torch.arange(3)
+    metadata = SimpleNamespace(
+        prefill=SimpleNamespace(shardq_gather_indices=rows),
+        decode=SimpleNamespace(requires_padding=padded),
+    )
+    context = SimpleNamespace(
+        attn_metadata={PREFIX: metadata},
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE if graph else CUDAGraphMode.NONE,
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+    k_cache = SimpleNamespace(prefix=PREFIX, shardq_compact_query=True)
+    indexer = SimpleNamespace(k_cache=k_cache)
+    got = attention.DeepseekV4Indexer._shardq_query_rows(indexer)
+    assert got is (rows if compact else None)

@@ -599,9 +599,11 @@ def _layer(
     kv = _kv_view(kv_cache, head_dim)
     num_heads = q_values.shape[1]
     # Under ShardQ the prefill chunks index the shardq_gather_indices tokens,
-    # which begin with the decode rows.
+    # which begin with the decode rows. The caller may have computed the query
+    # and weights of just those.
     prefill = metadata.prefill
-    if prefill is not None and (indices := prefill.shardq_gather_indices) is not None:
+    indices = None if prefill is None else prefill.shardq_gather_indices
+    if indices is not None and q_values.shape[0] != indices.shape[0]:
         q_values, q_scale, weights = (t[indices] for t in (q_values, q_scale, weights))
     return _Layer(
         metadata=metadata,
@@ -884,7 +886,7 @@ def rocm_mxfp4_sparse_attn_indexer(
             candidate_block_size if candidate_write else 0,
         )
         reserve_shardq_exchange(
-            k_cache_prefix, q_values, q_scale, weights, topk_indices_buffer
+            k_cache_prefix, topk_indices_buffer, q_values, q_scale, weights
         )
         return topk_indices_buffer
     layer = _layer(
@@ -941,7 +943,7 @@ def rocm_mxfp4_sparse_mqa_indexer(
             num_candidate_cols=num_candidate_cols,
         )
         reserve_shardq_exchange(
-            k_cache_prefix, q_values, q_scale, weights, topk_indices_buffer
+            k_cache_prefix, topk_indices_buffer, q_values, q_scale, weights
         )
         return topk_indices_buffer
     layer = _layer(

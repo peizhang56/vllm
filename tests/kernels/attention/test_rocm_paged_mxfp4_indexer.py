@@ -805,12 +805,14 @@ def test_decode_row_shard_matches_replicated(monkeypatch, world, query_lens):
 
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("gather", [True, False], ids=["gather", "dense"])
-def test_prefill_shardq_split_matches_replicated(monkeypatch, world, gather):
+@pytest.mark.parametrize("compact_q", [False, True], ids=["full_q", "compact_q"])
+def test_prefill_shardq_split_matches_replicated(monkeypatch, world, gather, compact_q):
     """Each TP rank scores its ShardQ tokens: the ratio-2 layer, the candidate
     source, and a consumer whose candidate rows of other ranks hold junk must
     select what the replicated run selects for them, and the exchange puts
     every row back in token order. Rows compare as sets: the top-k order
-    within a row depends on the batch shape."""
+    within a row depends on the batch shape. `compact_q` passes the query of
+    just the rank's tokens, as DeepSeek-V4 builds it."""
     from vllm.v1.attention.ops.shardq import ShardQSplit, zigzag_split
 
     set_random_seed(0)
@@ -833,6 +835,7 @@ def test_prefill_shardq_split_matches_replicated(monkeypatch, world, gather):
     def layers(tokens, pool):
         """The three layers over `tokens` (all rows when None)."""
         meta_rows, bounds, qsl, shardq = rows, chunk_bounds, query_start_loc, None
+        inputs = (q, q_scale, weights)
         if tokens is not None:
             meta_rows = [rows[t] for t in tokens]
             compact = np.searchsorted(tokens, [b[2:] for b in chunk_bounds])
@@ -843,6 +846,8 @@ def test_prefill_shardq_split_matches_replicated(monkeypatch, world, gather):
             ]
             qsl = np.searchsorted(tokens, query_start_loc).tolist()
             shardq = (split, torch.from_numpy(tokens).to(DEVICE))
+            if compact_q:
+                inputs = tuple(t[shardq[1]] for t in inputs)
 
         def run(op, ratio, *args, **kwargs):
             metadata = _prefill_metadata(
@@ -850,7 +855,7 @@ def test_prefill_shardq_split_matches_replicated(monkeypatch, world, gather):
             )
             _forward_context(monkeypatch, metadata)
             out = torch.full((num_rows, TOPK), 7, dtype=torch.int32, device=DEVICE)
-            op(hidden, "indexer", case.cache[ratio], q, q_scale, weights, TOPK,
+            op(hidden, "indexer", case.cache[ratio], *inputs, TOPK,
                HEAD_DIM, MAX_LEN // ratio, out, *args, **kwargs)  # fmt: skip
             return out
 

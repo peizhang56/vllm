@@ -1360,10 +1360,18 @@ def _gathers_shardq_topk(k_cache_prefix: str) -> bool:
     return getattr(layer, "gather_shardq_topk", False)
 
 
-def reserve_shardq_exchange(k_cache_prefix: str, *gathered: torch.Tensor) -> None:
-    """Profiling run: the layer's ShardQ gathers, live together."""
-    if _gathers_shardq_topk(k_cache_prefix):
-        _ = [torch.empty_like(t) for t in gathered]
+def reserve_shardq_exchange(
+    k_cache_prefix: str, topk_buffer: torch.Tensor, *inputs: torch.Tensor
+) -> None:
+    """Profiling run: the layer's ShardQ gathers of its inputs and top-k, live
+    together. A layer marked `shardq_compact_query` gathers its inputs only in
+    graph-replayed steps, far fewer rows than the profiled ones."""
+    layer = get_forward_context().no_compile_layers.get(k_cache_prefix)
+    if not getattr(layer, "gather_shardq_topk", False):
+        return
+    if getattr(layer, "shardq_compact_query", False):
+        inputs = ()
+    _ = [torch.empty_like(t) for t in (*inputs, topk_buffer)]
 
 
 def exchange_shardq_topk(
@@ -1504,7 +1512,7 @@ def rocm_aiter_sparse_attn_indexer(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
         if topk_indices_buffer is not None:
-            reserve_shardq_exchange(k_cache_prefix, q_fp8, weights, topk_indices_buffer)
+            reserve_shardq_exchange(k_cache_prefix, topk_indices_buffer, q_fp8, weights)
 
         return rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
@@ -1583,9 +1591,11 @@ def rocm_aiter_sparse_attn_indexer(
             ((total_seq_lens, 4), torch.uint8),
         )
         # Under ShardQ the chunks index the shardq_gather_indices tokens. The
+        # caller may have computed the query and weights of just those. The
         # candidate source and consumers keep their rows in that order too.
         prefill_q, prefill_weights = q_fp8, weights
-        if (indices := prefill_metadata.shardq_gather_indices) is not None:
+        indices = prefill_metadata.shardq_gather_indices
+        if indices is not None and q_fp8.shape[0] != indices.shape[0]:
             prefill_q, prefill_weights = q_fp8[indices], weights[indices]
         for chunk in prefill_metadata.chunks:
             local_length = chunk.total_seq_lens

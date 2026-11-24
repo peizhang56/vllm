@@ -974,6 +974,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 # the top-k back into token order: attention stays head-sharded.
                 k_cache = self.indexer.k_cache
                 k_cache.use_shardq = k_cache.gather_shardq_topk = True
+                # Its indexer builds the query of just those tokens.
+                k_cache.shardq_compact_query = True
         self._use_aiter_sparse_mla_decode = _aiter_sparse_mla_enabled(
             self._has_kv_transfer
         )

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
 )
@@ -1102,10 +1103,25 @@ class DeepseekV4Indexer(nn.Module):
                     )
                 return None, None, None
 
+        # A ShardQ step may score only this rank's rows: build the query of
+        # just those (the op detects the compact query). The compressor still
+        # sees every row.
+        q_input, q_input_scale, q_positions, q_weights = (
+            qr,
+            qr_scale,
+            positions,
+            indexer_weights,
+        )
+        if (rows := self._shardq_query_rows()) is not None:
+            q_input, q_positions = qr[rows], positions[rows]
+            q_weights = indexer_weights[rows]
+            if qr_scale is not None:
+                q_input_scale = qr_scale[rows]
+
         def wq_b_and_q_quant():
-            q = self._wq_b_proj(qr, qr_scale)
+            q = self._wq_b_proj(q_input, q_input_scale)
             q = q.view(-1, self.n_head, self.head_dim)
-            return self._q_rope_quant(positions, q, rotary_emb, indexer_weights)
+            return self._q_rope_quant(q_positions, q, rotary_emb, q_weights)
 
         if not skip_compressor:
             # compressor returns None and writes K to the indexer KV cache; the
@@ -1124,6 +1140,29 @@ class DeepseekV4Indexer(nn.Module):
         else:
             q, q_scale = q_quant, None
         return q, q_scale, weights
+
+    def _shardq_query_rows(self) -> torch.Tensor | None:
+        """The rows a ShardQ step scores on this rank (decode rows, then this
+        rank's prefill tokens; see shardq_gather_indices) when the index K
+        cache is marked `shardq_compact_query`, else None. Also None in
+        cudagraph capture or replay, which would bake in the rows, and with
+        padded decode rows, which the op reads past the decode tokens."""
+        if not getattr(self.k_cache, "shardq_compact_query", False):
+            return None
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if (
+            not isinstance(attn_metadata, dict)
+            or forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        metadata = attn_metadata[self.k_cache.prefix]
+        if metadata.prefill is None or (
+            metadata.decode is not None and metadata.decode.requires_padding
+        ):
+            return None
+        return metadata.prefill.shardq_gather_indices
 
     def _wq_b_proj(
         self, qr: torch.Tensor, qr_scale: torch.Tensor | None = None
