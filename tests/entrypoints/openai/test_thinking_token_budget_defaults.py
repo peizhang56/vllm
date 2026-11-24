@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Unit tests for thinking_token_budget propagation from default_sampling_params
-to SamplingParams in ChatCompletionRequest and CompletionRequest.
+"""Unit tests for thinking_token_budget propagation from default_sampling_params
+to SamplingParams in ChatCompletionRequest, CompletionRequest and
+ResponsesRequest.
 
 Same bug class as https://github.com/vllm-project/vllm/issues/22519 (fixed for
 stop_token_ids in tests/entrypoints/openai/test_stop_token_ids.py): a value set
@@ -20,6 +20,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
+)
+from vllm.entrypoints.openai.responses.protocol import (
+    ResponsesRequest,
 )
 
 
@@ -137,6 +140,80 @@ class TestCompletionThinkingTokenBudget:
 
         sampling_params = request.to_sampling_params(
             max_tokens=100,
+            default_sampling_params={"thinking_token_budget": 128},
+        )
+
+        assert sampling_params.thinking_token_budget == 0
+
+
+class TestResponsesThinkingTokenBudget:
+    """thinking_token_budget defaulting in ResponsesRequest."""
+
+    @pytest.fixture
+    def minimal_responses_request(self):
+        return ResponsesRequest(
+            model="test-model",
+            input="hello",
+        )
+
+    def test_default_thinking_token_budget_applied(self, minimal_responses_request):
+        """Server-default thinking_token_budget is applied when client sends none."""
+        sampling_params = minimal_responses_request.to_sampling_params(
+            default_max_tokens=100,
+            default_sampling_params={"thinking_token_budget": 128},
+        )
+
+        assert sampling_params.thinking_token_budget == 128
+
+    def test_client_thinking_token_budget_overrides_default(self):
+        """An explicit per-request value wins over the server default."""
+        request = ResponsesRequest(
+            model="test-model",
+            input="hello",
+            thinking_token_budget=1024,
+        )
+
+        sampling_params = request.to_sampling_params(
+            default_max_tokens=100,
+            default_sampling_params={"thinking_token_budget": 128},
+        )
+
+        assert sampling_params.thinking_token_budget == 1024
+
+    def test_no_default_and_no_request_value_stays_none(
+        self, minimal_responses_request
+    ):
+        """Absent both, the field stays None (no budget enforced)."""
+        sampling_params = minimal_responses_request.to_sampling_params(
+            default_max_tokens=100,
+            default_sampling_params={},
+        )
+
+        assert sampling_params.thinking_token_budget is None
+
+    def test_explicit_null_uses_default(self):
+        """An explicit null is treated as omitted."""
+        request = ResponsesRequest.model_validate(
+            {"model": "test-model", "input": "hello", "thinking_token_budget": None}
+        )
+
+        sampling_params = request.to_sampling_params(
+            default_max_tokens=100,
+            default_sampling_params={"thinking_token_budget": 128},
+        )
+
+        assert sampling_params.thinking_token_budget == 128
+
+    def test_client_zero_budget_not_swallowed_by_default(self):
+        """0 is a meaningful budget and must not fall through to the server default."""
+        request = ResponsesRequest(
+            model="test-model",
+            input="hello",
+            thinking_token_budget=0,
+        )
+
+        sampling_params = request.to_sampling_params(
+            default_max_tokens=100,
             default_sampling_params={"thinking_token_budget": 128},
         )
 

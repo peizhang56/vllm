@@ -694,6 +694,9 @@ class ResponsesRequest(OpenAIBaseModel):
                 "skip_special_tokens", True
             )
 
+        if (thinking_token_budget := self.thinking_token_budget) is None:
+            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+
         stop = self.stop if self.stop else []
         if isinstance(stop, str):
             stop = [stop]
@@ -724,7 +727,7 @@ class ResponsesRequest(OpenAIBaseModel):
             ),
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             extra_args=extra_args,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             skip_special_tokens=skip_special_tokens,

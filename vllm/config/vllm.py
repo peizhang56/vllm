@@ -2326,6 +2326,25 @@ class VllmConfig:
                     "Please check whether your reasoning parser has implemented "
                     "the `reasoning_start_str` and `reasoning_end_str`."
                 )
+        if (
+            self.model_config is not None
+            and "thinking_token_budget" in self.model_config.override_generation_config
+            and (self.reasoning_config is None or not self.reasoning_config.enabled)
+        ):
+            # The engine rejects any request with a thinking_token_budget when
+            # reasoning is not enabled, so applying it as a default would fail
+            # every request.
+            logger.warning(
+                "Ignoring the default thinking_token_budget from "
+                "--override-generation-config because reasoning is not "
+                "configured. Set --reasoning-parser and/or --reasoning-config "
+                "to enforce it."
+            )
+            self.model_config.override_generation_config = {
+                k: v
+                for k, v in self.model_config.override_generation_config.items()
+                if k != "thinking_token_budget"
+            }
 
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.

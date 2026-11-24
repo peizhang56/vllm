@@ -40,6 +40,7 @@ from vllm.config import (
     ObservabilityConfig,
     ParallelConfig,
     PoolerConfig,
+    ReasoningConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -3902,6 +3903,27 @@ def test_generation_config_loading():
     )
 
     assert model_config.get_diff_sampling_param() == override_generation_config
+
+
+@pytest.mark.parametrize("reasoning_parser", [None, "qwen3"])
+def test_default_thinking_token_budget_requires_reasoning(reasoning_parser):
+    """A server-default thinking_token_budget is dropped when reasoning is not
+    configured, since the engine would otherwise reject every request."""
+    model_config = ModelConfig(
+        "Qwen/Qwen3-0.6B",
+        generation_config="vllm",
+        override_generation_config={"thinking_token_budget": 128},
+    )
+    reasoning_config = (
+        None
+        if reasoning_parser is None
+        else ReasoningConfig(reasoning_parser=reasoning_parser)
+    )
+
+    VllmConfig(model_config=model_config, reasoning_config=reasoning_config)
+
+    expected = {} if reasoning_parser is None else {"thinking_token_budget": 128}
+    assert model_config.get_diff_sampling_param() == expected
 
 
 @pytest.mark.parametrize(
