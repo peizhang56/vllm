@@ -13,12 +13,20 @@ import torch.nn.functional as F
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    async_tensor_h2d,
+    direct_register_custom_op,
+)
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillMetadata,
+)
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -30,8 +38,9 @@ else:
 
 logger = init_logger(__name__)
 
-# Set once the first row-sharded indexer prefill runs (dispatch proof in the log).
-_ROW_SHARD_LOGGED = False
+# Set once the first ShardQ / row-local indexer prefill runs (dispatch proof in
+# the log).
+_SHARDQ_LOGGED = False
 _Q_COMPACT_LOGGED = False
 _DECODE_SHARD_LOGGED = False
 # TP row-sharding of the decode indexer rows (logits + top-k), the decode
@@ -1152,6 +1161,48 @@ def _max_decode_logits_rows(num_batched_tokens: int) -> int:
     return min(num_batched_tokens, max_num_seqs * (1 + num_spec))
 
 
+def _gathers_shardq_topk(k_cache_prefix: str) -> bool:
+    layer = get_forward_context().no_compile_layers.get(k_cache_prefix)
+    return getattr(layer, "gather_shardq_topk", False)
+
+
+def reserve_shardq_exchange(
+    k_cache_prefix: str, topk_buffer: torch.Tensor, *inputs: torch.Tensor
+) -> None:
+    """Profiling run: the layer's ShardQ gathers of its inputs and top-k, live
+    together. A layer marked `shardq_compact_query` gathers its inputs only in
+    graph-replayed steps, far fewer rows than the profiled ones."""
+    layer = get_forward_context().no_compile_layers.get(k_cache_prefix)
+    if not getattr(layer, "gather_shardq_topk", False):
+        return
+    if getattr(layer, "shardq_compact_query", False):
+        inputs = ()
+    _ = [torch.empty_like(t) for t in (*inputs, topk_buffer)]
+
+
+def exchange_shardq_topk(
+    k_cache_prefix: str,
+    prefill_metadata: DeepseekV32IndexerPrefillMetadata,
+    topk_buffer: torch.Tensor,
+    width: int,
+) -> None:
+    """Each TP rank scored only its ShardQ slice of the prefill tokens, written
+    compactly after the decode rows; for layers with `gather_shardq_topk`,
+    gather every rank's rows back into token order."""
+    split = prefill_metadata.shardq_split
+    if split is None or not _gathers_shardq_topk(k_cache_prefix):
+        return
+    start = split.num_decode_tokens
+    sizes = split.num_tokens_per_rank.tolist()
+    group = get_tp_group()
+    local = topk_buffer[start : start + sizes[group.rank_in_group], :width]
+    gathered = group.all_gatherv(local.contiguous(), dim=0, sizes=sizes)
+    if (rows := prefill_metadata.shardq_rows) is None:
+        rows = async_tensor_h2d(split.token_ids + start, device=topk_buffer.device)
+        prefill_metadata.shardq_rows = rows
+    topk_buffer[:, :width].index_copy_(0, rows, gathered)
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -1244,25 +1295,8 @@ def rocm_aiter_sparse_attn_indexer(
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
-        # The dummy run returns before the row-shard top-k exchange; reserve
-        # its transient (no-op unless TP prefill row-sharding is enabled, and
-        # skipped when no step can reach indexer_tp_shard_min_rows).
-        from vllm.config import get_current_vllm_config_or_none
-
-        cfg = get_current_vllm_config_or_none()
-        shard_reachable = cfg is None or (
-            cfg.scheduler_config.max_num_batched_tokens
-            >= cfg.attention_config.indexer_tp_shard_min_rows
-        )
-        if (topk_indices_buffer is not None and candidate_blocks is None
-                and shard_reachable):
-            from vllm.model_executor.layers.sparse_attn_indexer import (
-                _reserve_row_shard_exchange_transient,
-            )
-
-            _reserve_row_shard_exchange_transient(
-                topk_indices_buffer, hidden_states.device, uniform=True
-            )
+        if topk_indices_buffer is not None:
+            reserve_shardq_exchange(k_cache_prefix, topk_indices_buffer, q_fp8, weights)
 
         return rocm_aiter_sparse_attn_indexer_fake(
             hidden_states,
@@ -1326,30 +1360,40 @@ def rocm_aiter_sparse_attn_indexer(
             ((total_seq_lens, head_dim), FP8_DTYPE),
             ((total_seq_lens, 4), torch.uint8),
         )
-        # TP prefill row-sharding (the CUDA path's PrefillRowShard): each rank
-        # scores only its cost-balanced row window, then the ranks exchange the
-        # final int32 top-k. Rows are independent, so the result is the same
-        # as scoring every row on every rank. DSV4.1 candidate rows stay
-        # replicated, as on CUDA.
+        # Row-local step (dsv4_rowlocal_input): this rank scores the prefill
+        # rows of its own sequence-parallel slice, in place, and nothing is
+        # exchanged. DSV4.1 candidate rows stay replicated.
         row_shard = None
         if candidate_blocks is None:
             from vllm.model_executor.layers.sparse_attn_indexer import (
                 PrefillRowShard,
             )
 
-            row_shard = PrefillRowShard.from_metadata(
-                prefill_metadata, num_decode_tokens
-            )
-            global _ROW_SHARD_LOGGED
-            if row_shard is not None and not _ROW_SHARD_LOGGED:
-                _ROW_SHARD_LOGGED = True
+            row_shard = PrefillRowShard.rowlocal(prefill_metadata, num_decode_tokens)
+        # Under ShardQ the chunks index the shardq_gather_indices tokens. The
+        # caller may have computed the query and weights of just those. The
+        # candidate source and consumers keep their rows in that order too.
+        prefill_q, prefill_weights = q_fp8, weights
+        indices = prefill_metadata.shardq_gather_indices
+        if indices is not None and q_fp8.shape[0] != indices.shape[0]:
+            prefill_q, prefill_weights = q_fp8[indices], weights[indices]
+        global _SHARDQ_LOGGED
+        if not _SHARDQ_LOGGED and (row_shard is not None or indices is not None):
+            _SHARDQ_LOGGED = True
+            if row_shard is not None:
                 logger.info(
-                    "ROCm sparse indexer: TP prefill row-sharding active; "
-                    "first sharded step scores rows [%d, %d) of %d prefill "
-                    "rows here, top-k exchanged by all_gatherv",
+                    "ROCm sparse indexer: row-local prefill; this rank scores "
+                    "rows [%d, %d) of %d prefill rows, no top-k exchange",
                     row_shard.start,
                     row_shard.stop,
                     sum(row_shard.sizes),
+                )
+            else:
+                logger.info(
+                    "ROCm sparse indexer: ShardQ prefill; this rank scores %d "
+                    "of %d prefill tokens, top-k gathered by all_gatherv",
+                    indices.shape[0] - num_decode_tokens,
+                    layer_attn_metadata.num_prefill_tokens,
                 )
         # q_rows_compact: the model computed the index query (and weights)
         # only for rows [0, num_decode) U [shard.start, shard.stop), stacked
@@ -1357,7 +1401,7 @@ def rocm_aiter_sparse_attn_indexer(
         q_row_offset = 0
         if q_rows_compact:
             assert row_shard is not None, (
-                "compact index query rows need an active prefill row shard"
+                "compact index query rows need a row-local prefill shard"
             )
             local_rows = row_shard.stop - row_shard.start
             assert q_fp8.shape[0] == num_decode_tokens + local_rows, (
@@ -1372,8 +1416,7 @@ def rocm_aiter_sparse_attn_indexer(
                 _Q_COMPACT_LOGGED = True
                 logger.info(
                     "ROCm sparse indexer: index query computed for decode rows "
-                    "+ this rank's prefill rows only (%d of %d rows); top-k "
-                    "exchanged by uniform all_gather",
+                    "+ this rank's row-local prefill rows only (%d of %d rows)",
                     q_fp8.shape[0],
                     num_decode_tokens + sum(row_shard.sizes),
                 )
@@ -1403,9 +1446,9 @@ def rocm_aiter_sparse_attn_indexer(
             )
             q_lo, q_hi = row_start - q_row_offset, row_end - q_row_offset
             logits = rocm_fp8_mqa_logits(
-                q_fp8[q_lo:q_hi],
+                prefill_q[q_lo:q_hi],
                 (k_fp8, k_scale.view(torch.float32)),
-                weights[q_lo:q_hi],
+                prefill_weights[q_lo:q_hi],
                 cu_seqlen_ks,
                 cu_seqlen_ke,
             )
@@ -1463,12 +1506,9 @@ def rocm_aiter_sparse_attn_indexer(
                     topk_tokens,
                 )
 
-        if row_shard is not None:
-            # Rows are already fully ranked, so this is a layout gather.
-            if q_rows_compact:
-                row_shard.exchange_topk_uniform(topk_indices_buffer, topk_tokens)
-            else:
-                row_shard.exchange_topk(topk_indices_buffer, topk_tokens)
+        exchange_shardq_topk(
+            k_cache_prefix, prefill_metadata, topk_indices_buffer, topk_tokens
+        )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode

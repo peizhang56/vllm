@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.attention import active_attention_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -145,6 +145,18 @@ def _trust_dsv4_extra_cache_nan_free(
         and kv_cache_dtype == "fp8_ds_mla"
         and not has_kv_transfer
         and has_extra_cache
+    )
+
+
+def _indexer_shardq_enabled(vllm_config: VllmConfig) -> bool:
+    parallel = vllm_config.parallel_config
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode or CUDAGraphMode.NONE
+    return (
+        vllm_config.attention_config.sparse_mla_shard_q
+        and parallel.tensor_parallel_size > 1
+        and parallel.decode_context_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and cudagraph_mode.mixed_mode() != CUDAGraphMode.FULL
     )
 
 
@@ -1120,6 +1132,13 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         else:
             # Disable indexer inner overlap.
             self.indexer.aux_stream = None
+            if _indexer_shardq_enabled(vllm_config):
+                # The indexer scores this rank's ShardQ tokens, then gathers
+                # the top-k back into token order: attention stays head-sharded.
+                k_cache = self.indexer.k_cache
+                k_cache.use_shardq = k_cache.gather_shardq_topk = True
+                # Its indexer builds the query of just those tokens.
+                k_cache.shardq_compact_query = True
         self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(self._has_kv_transfer)
         self._sp_vllm_config = vllm_config
         self._sp_comp_shard: bool | None = None
@@ -1532,7 +1551,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             return None
         if self.indexer is None:
             return 0
-        if self.indexer._compact_q_row_shard(attn_metadata, None) is None:
+        if self.indexer._rowlocal_metadata(attn_metadata, None) is None:
             return None
         meta = attn_metadata[self.indexer.k_cache.prefix]
         return int(meta.num_decode_tokens)

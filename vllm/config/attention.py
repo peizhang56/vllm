@@ -110,7 +110,23 @@ class AttentionConfig:
 
     indexer_tp_shard_min_rows: int = Field(default=65536, ge=1)
     """Minimum total prefill rows for the sparse-attention indexer to split
-    them across TP ranks instead of scoring every row on each rank."""
+    them across TP ranks instead of scoring every row on each rank (CUDA)."""
+
+    sparse_mla_shard_q: bool = True
+    """Under tensor parallelism, shard the sparse-attention indexer prefill by
+    token: each TP rank scores its zigzag slice of the prefill tokens and the
+    ranks all-gather the int32 top-k back into token order. On ROCm,
+    DeepSeek-V4 and V4.1 shard only their indexer prefill this way; their
+    attention stays sharded by head. On DeepSeek-V4 steps that run
+    sequence-parallel with row-local attention (`dsv4_rowlocal_input`), each
+    rank scores its own sequence-parallel rows instead and nothing is
+    exchanged. Off under DCP or PCP, and when the mixed CUDA-graph mode is
+    FULL."""
+
+    sparse_mla_shard_q_min_tokens: int = Field(default=1024, ge=1)
+    """Minimum number of tokens after a step's decodes (requests of at most
+    1 + num_speculative_tokens tokens) for `sparse_mla_shard_q` to apply. Below
+    it the exchange can cost more than it saves."""
 
     minimax_m3_indexer_cp: bool = False
     """MiniMax M3 on ROCm with tensor_parallel_size > 1: score the sparse
@@ -141,8 +157,9 @@ class AttentionConfig:
 
     dsv4_rowlocal_input: bool = False
     """DeepSeek-V4 on ROCm: on a row-local sequence-parallel step, skip the attention
-    layer-input gather and align the indexer shard to the rank's own rows. Needs
-    dsv4_rowlocal_attention."""
+    layer-input gather and score the indexer prefill on the rank's own rows
+    instead of its `sparse_mla_shard_q` split. Needs dsv4_rowlocal_attention and
+    sparse_mla_shard_q."""
 
     dsv4_attn_e8m0: bool = False
     """DeepSeek-V4 on ROCm: e8m0 scale route for the attention GEMMs (FlyDSL mxscale

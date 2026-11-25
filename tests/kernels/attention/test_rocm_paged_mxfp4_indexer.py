@@ -257,6 +257,7 @@ def _prefill_metadata(
                 token_start=t0,
                 token_end=t1,
                 num_reqs=req_hi - req_lo,
+                req_start=req_lo,
             )
         )
     seq_lens = torch.tensor(case.seq_lens)
@@ -279,7 +280,9 @@ def _prefill_metadata(
         num_decode_tokens=0,
         num_prefills=len(case.seq_lens),
         num_prefill_tokens=len(rows),
-        prefill=types.SimpleNamespace(chunks=chunks),
+        prefill=types.SimpleNamespace(
+            chunks=chunks, shardq_gather_indices=None, shardq_split=None
+        ),
         prefill_plans=plans,
         gather_launches=plan_gather_launches(chunks, plans, gather_rows),
     )

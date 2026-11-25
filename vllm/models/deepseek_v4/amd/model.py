@@ -1613,6 +1613,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             "INT4 reduce-scatter, seams on M/8 rows, fp8 1x128 gather)",
             SEQ_PARALLEL_LABEL, get_tensor_model_parallel_rank(), SEQ_PARALLEL_MIN_ROWS, mbt,
         )
+        attn_config = vllm_config.attention_config
+        if attn_config.dsv4_rowlocal_attention and attn_config.dsv4_rowlocal_input:
+            # Row-local steps score each rank's own rows of the FP8 indexer
+            # instead of its ShardQ split (see PrefillRowShard.rowlocal).
+            for layer in self.layers[self.start_layer:self.end_layer]:
+                indexer = getattr(layer.attn, "indexer", None)
+                if indexer is None or indexer.use_fp4_kv:
+                    continue
+                k_cache = indexer.k_cache
+                if getattr(k_cache, "use_shardq", False):
+                    k_cache.shardq_rowlocal_min_tokens = SEQ_PARALLEL_MIN_ROWS
         if _SP_COMPRESSOR_SHARD:
             logger.info(
                 "%s: compressor row shard armed on rank %d (window-aligned split of the "
