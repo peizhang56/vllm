@@ -183,10 +183,21 @@ class AttentionConfig:
     GPU. Ignored, with the reasons logged, when sequence parallelism cannot
     engage."""
 
+    dsv4_sp_moe: bool = False
+    """With `dsv4_seq_parallel`: run the MoE of sequence-parallel steps on the
+    rank's own rows where it can. Each rank routes its 1/8 of the rows and the
+    routing rides in the fp8 layer-input gather; the routed experts take the
+    gathered fp8 codes directly (steps of at least 2048 rows); a full copy of
+    the shared expert (about 3.8 GiB per GPU) runs on the rank's own rows; and
+    the routed experts' per-slot output is summed inside the reduce-scatter
+    when AITER provides `qr_reduce_scatter_route`. No effect without
+    `dsv4_seq_parallel`."""
+
     dsv4_sp_self_check: bool = False
     """Debug only: one-time bitwise self-checks of the `dsv4_seq_parallel` fp8
-    handoff against the requantizing path. A check that fails on one rank
-    raises there while the other ranks wait in the next collective."""
+    handoff (and of `dsv4_sp_moe`) against the unfused path. A check that
+    fails on one rank raises there while the other ranks wait in the next
+    collective."""
 
     hisparse_config: HiSparseConfig | None = None
     """HiSparse host-resident KV configuration. Setting this enables experimental

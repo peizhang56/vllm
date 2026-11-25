@@ -304,6 +304,10 @@ class MoERunner(MoERunnerInterface):
                 mk_can_overlap_shared_experts=can_overlap,
             )
 
+        # (topk_weights, topk_ids) passed to forward(), held for the duration
+        # of that call only: the custom op cannot carry them to _forward_impl.
+        self._precomputed_routing: tuple[torch.Tensor, torch.Tensor] | None = None
+
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
@@ -648,6 +652,9 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        precomputed = self._precomputed_routing
+        if precomputed is not None and self.routed_experts.quant_method.is_monolithic:
+            raise NotImplementedError("precomputed routing needs a modular MoE kernel")
         if (
             self.routed_experts.quant_method.is_monolithic
             and self.moe_config.dp_size > 1
@@ -681,12 +688,20 @@ class MoERunner(MoERunnerInterface):
         else:
             assert hidden_states_scale is None
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if precomputed is not None:
+                topk_weights, topk_ids = precomputed
+                if topk_ids.shape[0] != hidden_states.shape[0]:
+                    raise ValueError(
+                        f"precomputed routing for {topk_ids.shape[0]} rows, "
+                        f"input has {hidden_states.shape[0]}"
+                    )
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -746,15 +761,25 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        *,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        defer_shared_add: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Invoke the fused moe layer.
 
         Input:
         - hidden_states
         - router_logits
+        - topk_weights, topk_ids: optional routing of every row, as the
+          router's select_experts returns it. When given, the gate and the
+          router are skipped (modular kernels only).
+        - defer_shared_add: return (shared_output, routed_output) unsummed,
+          so the caller can reduce and add the two terms itself. Needs a
+          separate shared expert and `moe_config.skip_final_all_reduce`.
 
         Output:
-        - The new hidden_states.
+        - The new hidden_states, or the (shared, routed) pair.
 
         Calling sequence
         - forward
@@ -789,16 +814,44 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-            self._encode_layer_name(),
-            self.moe_config.hidden_dim_unpadded
-            if self._quant_method.has_unpadded_output
-            else 0,
-        )
+        if defer_shared_add and (
+            # The caller adds the two terms itself, so everything forward()
+            # skips then (the output transform, the add, the final all-reduce
+            # and trim, the zero expert) must be a no-op.
+            self._shared_experts is None
+            or not self.moe_config.skip_final_all_reduce
+            or self._fused_output_is_reduced
+            or self.routed_output_transform is not None
+            or og_hidden_dim_post_xform is not None
+            or isinstance(self.router, ZeroExpertRouter)
+        ):
+            raise NotImplementedError(
+                "defer_shared_add needs a separate shared expert, "
+                "skip_final_all_reduce, an unreduced untransformed routed "
+                "output and no zero expert"
+            )
+        if (topk_weights is None) != (topk_ids is None):
+            raise ValueError("topk_weights and topk_ids go together")
+        if topk_ids is not None:
+            if self._fse_fuse_gate:
+                # The fused gate also yields the shared expert gate's logits.
+                raise NotImplementedError(
+                    "precomputed routing with a fused shared expert gate"
+                )
+            self._precomputed_routing = (topk_weights, topk_ids)
+        try:
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                self._encode_layer_name(),
+                self.moe_config.hidden_dim_unpadded
+                if self._quant_method.has_unpadded_output
+                else 0,
+            )
+        finally:
+            self._precomputed_routing = None
 
         #
         # Note: there are two all-reduce points below. They are mutually
@@ -836,6 +889,10 @@ class MoERunner(MoERunnerInterface):
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
         )
+
+        if defer_shared_add:
+            assert shared_output is not None
+            return shared_output, fused_output
 
         # Apply output transform (e.g. latent -> full dim). A transform that
         # sets `accumulates_residual` adds the shared output itself, e.g. in
@@ -998,7 +1055,7 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        if self.gate is not None and self._precomputed_routing is None:
             if self._fse_fuse_gate:
                 router_logits = dispatch_unquantized_gemm()(
                     self, hidden_states, self._combined_gate_weight, None

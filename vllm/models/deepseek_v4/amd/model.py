@@ -18,6 +18,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.mxfp8.aiter_flydsl import (
@@ -31,13 +32,16 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     FusedMoEQuantConfig,
     GateLinear,
+    MoERunner,
     RoutedExperts,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+    AiterMxfp4Experts,
     derive_aiter_quant_type,
     mxfp4_w4a16_extra_kwargs,
     rocm_aiter_fused_experts,
+    set_rocm_aiter_fused_moe_input_hook,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
@@ -101,15 +105,26 @@ from vllm.models.deepseek_v4.amd.rocm import (
     DeepseekV4ROCMAiterMLAAttention,
 )
 from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
+    GATHER_TAIL_BYTES,
     SEQ_PARALLEL_LABEL,
     SEQ_PARALLEL_MIN_ROWS,
+    SP_MOE_LABEL,
+    SP_ROUTE_FOLD_LABEL,
+    SP_ROUTER_SHARD_LABEL,
+    SP_SHARED_ROWLOCAL_LABEL,
     SeqParallelSeamComm,
     SeqParallelStep,
+    routing_tail_bytes,
     set_sp_self_check,
     sp_config_disable_reasons,
     sp_fp8_form,
     sp_fp8_handoff_check,
     sp_fp8_handoff_clear,
+    sp_fused_moe_input_hook,
+    sp_moe_codes_done,
+    sp_moe_codes_wanted,
+    sp_route_capture,
+    sp_self_check_enabled,
 )
 from vllm.models.deepseek_v4.amd.silu_and_mul_mxfp8 import silu_and_mul_mxfp8
 from vllm.models.deepseek_v4.common.spec_decode import needs_mtp_hidden_buffer
@@ -205,6 +220,12 @@ class DeepseekV4MLP(nn.Module):
         # Whether down_proj reads row-major MXFP8 as is; resolved on first use,
         # after the weights are processed.
         self._down_takes_mxfp8: bool | None = None
+        # dsv4_sp_moe: the full (non-TP) copy of the shared expert also
+        # preshuffles down_proj (forward_rowlocal); the TP copy skips the calls
+        # whose shared term the full copy computes on the rank's own rows.
+        self._rowlocal_full = False
+        self._down_scale: torch.Tensor | None = None
+        self._sp_skip = False
 
     def prepare_gateup_preshuffle(self) -> None:
         # B-preshuffle the gate_up_proj weight in place (single weight).
@@ -215,33 +236,61 @@ class DeepseekV4MLP(nn.Module):
         # forward() falls back to the standard gate_up_proj linear
         if on_gfx1250():
             return
+        ws = self._preshuffle_linear(self.gate_up_proj)
+        if ws is None:
+            return
+        # A plain tensor (the scale Parameter would register a second time on
+        # this module), refilled in place on reloads for captured CUDA graphs.
+        refill_derived(self, "_gateup_scale", ws.detach())
+        if self._rowlocal_full:
+            ws = self._preshuffle_linear(self.down_proj)
+            if ws is not None:
+                refill_derived(self, "_down_scale", ws.detach())
+
+    @staticmethod
+    def _preshuffle_linear(linear: nn.Module) -> torch.Tensor | None:
+        """B-preshuffle a block-fp8 linear's weight in place and return its fp32
+        block scale; None if the weight does not qualify."""
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
             get_fp8_block_weight_scale,
         )
 
-        w = getattr(self.gate_up_proj, "weight", None)
-        ws = get_fp8_block_weight_scale(self.gate_up_proj)
+        w = getattr(linear, "weight", None)
+        ws = get_fp8_block_weight_scale(linear)
         if w is None or ws is None or w.dim() != 2:
-            return
+            return None
         # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
         if w.shape[-1] % 128 != 0 or w.shape[0] % 16 != 0:
-            return
+            return None
         if ws.dtype == torch.float8_e8m0fnu:
             ws = _upcast_e8m0_to_fp32(ws).contiguous()
         # Skip when the linear kernel already B-preshuffled this weight.
         if not (
-            getattr(self.gate_up_proj, "aiter_bpreshuffled", False)
-            or is_weights_pre_processed()
+            getattr(linear, "aiter_bpreshuffled", False) or is_weights_pre_processed()
         ):
             replace_parameter(
-                self.gate_up_proj,
+                linear,
                 "weight",
                 rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
             )
-        # A plain tensor (the scale Parameter would register a second time on
-        # this module), refilled in place on reloads for captured CUDA graphs.
-        refill_derived(self, "_gateup_scale", ws.detach())
+        return ws
+
+    def forward_rowlocal(self, x: torch.Tensor) -> torch.Tensor:
+        """The full shared expert (no TP) on this rank's own rows, both GEMMs
+        on the AITER fp8 block-scale B-preshuffle kernel gate_up uses."""
+        if self._gateup_scale is None or self._down_scale is None:
+            return self.forward(x)
+        gate_up = self._gateup_requant(x)
+        h = self.act_fn(gate_up)
+        h_fp8, h_scale = rocm_aiter_ops.group_fp8_quant(h, transpose_scale=True)
+        return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            h_fp8,
+            self.down_proj.weight,
+            h_scale,
+            self._down_scale,
+            output_dtype=x.dtype,
+        )
 
     def _gateup_requant(self, x: torch.Tensor) -> torch.Tensor:
         # gate_up via fp8 group-quant (col-major) + B-preshuffle GEMM.
@@ -255,6 +304,11 @@ class DeepseekV4MLP(nn.Module):
         )
 
     def forward(self, x):
+        if self._sp_skip:
+            # dsv4_sp_moe: the full copy computes this call's shared term on
+            # the rank's own rows; the MoE runner hands this placeholder back
+            # unsummed (defer_shared_add) and the caller drops it.
+            return torch.empty_like(x)
         if self._gateup_scale is not None and x.dim() == 2:
             form = sp_fp8_form(x)
             if form is not None:
@@ -682,6 +736,7 @@ class DeepseekV4MoE(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         fuse_heterogeneous_shared_expert: bool = False,
+        sp_moe: bool = False,
     ):
         super().__init__()
 
@@ -804,6 +859,12 @@ class DeepseekV4MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
+        # dsv4_sp_moe: a full (non-TP) copy of the shared expert, run on each
+        # rank's own rows on sequence-parallel steps. Set below.
+        self.shared_experts_full: DeepseekV4MLP | None = None
+        self._sp_router_shard: bool | None = None
+        self._sp_moe_codes: bool | None = None
+
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0
 
@@ -840,6 +901,19 @@ class DeepseekV4MoE(nn.Module):
         fuse_shared_into_routed = (
             self.is_fused_shared_expert_enabled or self.fuse_heterogeneous_shared_expert
         )
+        if sp_moe and self.shared_experts is not None and not fuse_shared_into_routed:
+            self.shared_experts_full = DeepseekV4MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                hidden_act=config.hidden_act,
+                swiglu_limit=self.swiglu_limit,
+                quant_config=shared_quant_config,
+                reduce_results=False,
+                is_sequence_parallel=True,
+                prefix=f"{prefix}.shared_experts_full",
+            )
+            self.shared_experts_full._rowlocal_full = True
         self.experts = FusedMoEFactory(
             shared_experts=(None if fuse_shared_into_routed else self.shared_experts),
             n_shared_experts=(
@@ -878,13 +952,16 @@ class DeepseekV4MoE(nn.Module):
             ),
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def _check_input_ids(self, input_ids: torch.Tensor | None) -> None:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
         if self.gate.bias_vl is not None and input_ids is None:
             raise ValueError("DeepSeek V4 vision MoE routing requires input_ids.")
+
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        self._check_input_ids(input_ids)
 
         org_shape = hidden_states.shape
         if self.use_mega_moe:
@@ -898,19 +975,93 @@ class DeepseekV4MoE(nn.Module):
         return final_hidden_states.view(org_shape)
 
     def forward_partial(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        routing: tuple[torch.Tensor, torch.Tensor] | None = None,
+        defer_shared_add: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """forward() without the final TP all-reduce: this rank's partial sum
-        (routed + shared), which sequence-parallel steps reduce-scatter."""
+        (routed + shared), which sequence-parallel steps reduce-scatter.
+
+        routing: (topk_weights, topk_ids) of every row (route_rows), used
+        instead of the runner's gate and top-k. defer_shared_add: return
+        (shared, routed) unsummed.
+        """
         if self.use_mega_moe:
             raise RuntimeError("sequence-parallel MoE does not support aiter_mega_moe")
         cfg = self.experts.moe_config
         prev = cfg.skip_final_all_reduce
         cfg.skip_final_all_reduce = True
         try:
-            return self.forward(hidden_states, input_ids)
+            if routing is None and not defer_shared_add:
+                return self.forward(hidden_states, input_ids)
+            if routing is None:
+                self._check_input_ids(input_ids)
+            out = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                input_ids=input_ids,
+                topk_weights=None if routing is None else routing[0],
+                topk_ids=None if routing is None else routing[1],
+                defer_shared_add=defer_shared_add,
+            )
         finally:
             cfg.skip_final_all_reduce = prev
+        if isinstance(out, tuple):
+            return tuple(t.view(hidden_states.shape) for t in out)
+        return out.view(hidden_states.shape)
+
+    def sp_router_shard_ok(self) -> bool:
+        """Whether this layer may route its own rows on sequence-parallel steps
+        (dsv4_sp_moe): a learned router (no hash routing, no vision bias) on a
+        modular MoE kernel, the runner holding the plain gate, and nothing
+        that must see every row's routing (EPLB, routed-expert capture)."""
+        if self._sp_router_shard is None:
+            runner = self.experts
+            router = getattr(runner, "router", None)
+            self._sp_router_shard = (
+                not self.use_mega_moe
+                and self.gate.tid2eid is None
+                and self.gate.bias_vl is None
+                and isinstance(runner, MoERunner)
+                and runner.gate is self.gate
+                and not runner._fse_fuse_gate
+                and not runner.routed_experts.quant_method.is_monolithic
+                and router is not None
+                and router.eplb_state is None
+                and getattr(router, "capture_fn", None) is None
+                and getattr(router, "_routing_replay_out", None) is None
+            )
+        return self._sp_router_shard
+
+    def sp_moe_codes_ok(self) -> bool:
+        """Whether the routed experts can take MXFP8 codes for their input
+        (dsv4_sp_moe): the runner hands the input to AITER fused_moe as is (no
+        input transform, no padding, no quantization before the kernel)."""
+        if self._sp_moe_codes is None:
+            runner = self.experts
+            kernel = getattr(runner._quant_method, "moe_kernel", None)
+            experts = getattr(kernel, "fused_experts", None)
+            self._sp_moe_codes = (
+                isinstance(experts, AiterMxfp4Experts)
+                and experts.expects_unquantized_inputs
+                and experts.quant_config.a1_scale is None
+                and runner.routed_input_transform is None
+                and runner.moe_config.hidden_dim == self.hidden_size
+            )
+        return self._sp_moe_codes
+
+    def route_rows(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The served routing (the runner's gate and router) of the rows x:
+        (topk_weights, topk_ids)."""
+        runner = self.experts
+        logits, _ = self.gate(x)
+        return runner.router.select_experts(
+            hidden_states=x,
+            router_logits=logits,
+            topk_indices_dtype=runner._quant_method.topk_indices_dtype,
+        )
 
     def _forward_mega_moe(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
@@ -956,8 +1107,103 @@ class DeepseekV4MoE(nn.Module):
         return self.experts(hidden_states, topk_weights, topk_ids)
 
 
+# dsv4_sp_moe: one dispatch line per rank for the router shard and the
+# row-local shared expert.
+_SP_ROUTER_SHARD_LOGGED = False
+_SP_SHARED_ROWLOCAL_LOGGED = False
+
+
+def _shared_rowlocal_log(
+    layer: "DeepseekV4DecoderLayer",
+    x: torch.Tensor,
+    xs: torch.Tensor,
+    shr: torch.Tensor,
+    sp: SeqParallelStep,
+) -> None:
+    """At the first row-local shared expert call on this rank: a dispatch line,
+    and with dsv4_sp_self_check a comparison against the TP shared expert's
+    slices on all rows, summed exactly (fp32 all-reduce). The fp8 quant groups
+    are the same on both sides, so they differ only by GEMM accumulation order
+    and bf16 rounding. Raises on non-finite rows or a relative L2 above 5%."""
+    rank = get_tensor_model_parallel_rank()
+    if not sp_self_check_enabled():
+        logger.info(
+            "%s: full shared expert on rank %d's own %d of %d rows; the "
+            "reduce-scatter carries the routed term only",
+            SP_SHARED_ROWLOCAL_LABEL,
+            rank,
+            xs.shape[0],
+            sp.m,
+        )
+        return
+    # The same layer on every rank, so this extra all-reduce is matched.
+    ref = layer.ffn.shared_experts(x).float()
+    torch.distributed.all_reduce(ref, group=get_tp_group().device_group)
+    n = max(min(sp.start + sp.s, sp.m) - sp.start, 0)
+    a, b = shr[:n].float(), ref[sp.start : sp.start + n]
+    bn = float(b.norm()) if n else 0.0
+    rel = float((a - b).norm()) / max(bn, 1e-30) if n else 0.0
+    finite = bool(torch.isfinite(a).all())
+    logger.info(
+        "%s: full shared expert on rank %d's own %d of %d rows; self-check "
+        "against the TP slices summed exactly: rel L2 %.4g (ref norm %.4g), "
+        "finite %s",
+        SP_SHARED_ROWLOCAL_LABEL,
+        rank,
+        n,
+        sp.m,
+        rel,
+        bn,
+        finite,
+    )
+    if not finite or (rel > 0.05 and bn > 1e-2):
+        raise RuntimeError(
+            f"{SP_SHARED_ROWLOCAL_LABEL}: row-local shared expert differs (rel {rel})"
+        )
+
+
 # Hidden sizes supported by AITER mhc_pre_big_fuse_rmsnorm.
 _AITER_MHC_FUSED_RMSNORM_SIZES = frozenset({1280, 2560, 4096, 7168})
+
+
+def _mhc_fusion(hidden_size: int, hc_mult: int) -> tuple[bool, bool]:
+    """(fused mHC post+pre, attn/ffn RMSNorm folded into the mHC seam)."""
+    # AITER mhc kernels (pre/post/fused) require hc_mult == 4.
+    use_aiter_mhc = HAS_AITER_MHC and hidden_size % 256 == 0 and hc_mult == 4
+    # Prefer AITER fused post+pre when eligible; otherwise TileLang.
+    use_fused_mhc = use_aiter_mhc or HAS_TILELANG_MHC
+    # Fold attn/ffn RMSNorm into MHC only when the active backend's
+    # fused-rmsnorm path supports this hidden size.
+    if use_aiter_mhc:
+        fuse_rmsnorm = hidden_size in _AITER_MHC_FUSED_RMSNORM_SIZES
+    else:
+        fuse_rmsnorm = HAS_TILELANG_MHC and use_fused_mhc
+    return use_fused_mhc, fuse_rmsnorm
+
+
+def _sp_moe_requested(vllm_config: VllmConfig) -> bool:
+    """Whether dsv4_sp_moe can engage (decided before the layers are built:
+    the full shared expert copy costs about 3.8 GiB per GPU)."""
+    attn = vllm_config.attention_config
+    if not attn.dsv4_sp_moe:
+        return False
+    if not attn.dsv4_seq_parallel:
+        logger.warning("%s ignored: dsv4_seq_parallel is off", SP_MOE_LABEL)
+        return False
+    config = vllm_config.model_config.hf_config
+    reasons = sp_config_disable_reasons(vllm_config)
+    if vllm_config.kernel_config.moe_backend == "aiter_mega_moe":
+        reasons.append("aiter_mega_moe")
+    use_fused_mhc, fuse_rmsnorm = _mhc_fusion(config.hidden_size, config.hc_mult)
+    if not (use_fused_mhc and fuse_rmsnorm):
+        reasons.append("the mHC seam does not fold the RMSNorm")
+    if routing_tail_bytes(config.num_experts_per_tok) > GATHER_TAIL_BYTES:
+        reasons.append(f"top-k {config.num_experts_per_tok}")
+    if reasons:
+        # dsv4_seq_parallel logs the deployment reasons itself.
+        logger.warning("%s ignored: %s", SP_MOE_LABEL, ", ".join(reasons))
+        return False
+    return True
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -968,6 +1214,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         fuse_heterogeneous_shared_expert: bool = False,
+        sp_moe: bool = False,
     ):
         super().__init__()
 
@@ -989,7 +1236,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             vllm_config,
             prefix=f"{prefix}.ffn",
             fuse_heterogeneous_shared_expert=fuse_heterogeneous_shared_expert,
+            sp_moe=sp_moe,
         )
+        # dsv4_sp_moe armed for this layer (set by the model).
+        self.sp_moe = False
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1044,18 +1294,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
-        # AITER mhc kernels (pre/post/fused) require hc_mult == 4.
-        use_aiter_mhc = (
-            HAS_AITER_MHC and self.hidden_size % 256 == 0 and self.hc_mult == 4
+        self.use_fused_mhc, self.fuse_mhc_rmsnorm = _mhc_fusion(
+            self.hidden_size, self.hc_mult
         )
-        # Prefer AITER fused post+pre when eligible; otherwise TileLang.
-        self.use_fused_mhc = use_aiter_mhc or HAS_TILELANG_MHC
-        # Fold attn/ffn RMSNorm into MHC only when the active backend's
-        # fused-rmsnorm path supports this hidden size.
-        if use_aiter_mhc:
-            self.fuse_mhc_rmsnorm = self.hidden_size in _AITER_MHC_FUSED_RMSNORM_SIZES
-        else:
-            self.fuse_mhc_rmsnorm = HAS_TILELANG_MHC and self.use_fused_mhc
         # Decode steps of an eligible layer may run as the mono decode layer.
         self.mono = MonoDecodeLayer.create(self, vllm_config)
 
@@ -1252,6 +1493,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
         )
+        if self.sp_moe and fold:
+            return self._sp_moe_ffn(xs, input_ids, sp), residual, post_mix, res_mix
         x = sp.gather(xs)
         if not fold:
             x = self.ffn_norm(x)
@@ -1261,6 +1504,97 @@ class DeepseekV4DecoderLayer(nn.Module):
             sp_fp8_handoff_clear()
         x = sp.reduce_scatter(f)
         return x, residual, post_mix, res_mix
+
+    def _sp_moe_ffn(
+        self, xs: torch.Tensor, input_ids: torch.Tensor | None, sp: SeqParallelStep
+    ) -> torch.Tensor:
+        """The FFN sublayer of a sequence-parallel step with dsv4_sp_moe, from
+        this rank's normalized FFN input rows xs [Mp/8, H] to its reduced output
+        rows [Mp/8, H].
+
+        Routes xs here and gathers the routing with the rows; gives the routed
+        experts the gathered fp8 codes; runs the full shared expert on xs and
+        adds it after the reduce-scatter, which then carries the routed term
+        only (summed from the per-slot rows when the route fold is on).
+        """
+        ffn = self.ffn
+        full = ffn.shared_experts_full
+        shared_rowlocal = full is not None and full._down_scale is not None
+        router_shard = ffn.sp_router_shard_ok()
+        routing = None
+        if router_shard:
+            # Codes only when every reader of the gathered rows takes the codes:
+            # the routed experts and, unless it is row-local, the TP shared
+            # expert's gate_up.
+            codes_only = (
+                sp_moe_codes_wanted(sp.m)
+                and ffn.sp_moe_codes_ok()
+                and (
+                    shared_rowlocal
+                    or ffn.shared_experts is None
+                    or ffn.shared_experts._gateup_scale is not None
+                )
+            )
+            weights, ids = ffn.route_rows(xs)
+            x, gw, gi = sp.gather_with_routing(xs, weights, ids, codes_only)
+            routing = (gw, gi)
+            global _SP_ROUTER_SHARD_LOGGED
+            if not _SP_ROUTER_SHARD_LOGGED:
+                _SP_ROUTER_SHARD_LOGGED = True
+                logger.info(
+                    "%s: MoE routing row-sharded on rank %d (%s: %d of %d rows "
+                    "routed locally, routing carried in the fp8 layer-input "
+                    "gather)",
+                    SP_ROUTER_SHARD_LABEL,
+                    get_tensor_model_parallel_rank(),
+                    ffn.prefix,
+                    xs.shape[0],
+                    x.shape[0],
+                )
+        else:
+            x = sp.gather(xs)
+
+        shr = None
+        tp_shared = ffn.shared_experts
+        if shared_rowlocal:
+            assert full is not None and tp_shared is not None
+            shr = full.forward_rowlocal(xs)
+            global _SP_SHARED_ROWLOCAL_LOGGED
+            if not _SP_SHARED_ROWLOCAL_LOGGED:
+                _SP_SHARED_ROWLOCAL_LOGGED = True
+                _shared_rowlocal_log(self, x, xs, shr, sp)
+            tp_shared._sp_skip = True
+        # The slot fold needs the routed term on its own: only with the
+        # row-local shared expert, and only if the runner leaves the routed
+        # output as stage 2 writes it.
+        runner = ffn.experts
+        route_fold = (
+            shr is not None
+            and sp.comm.route_fold
+            and getattr(runner, "routed_scaling_factor", 1.0) == 1.0
+            and getattr(runner, "routed_output_transform", None) is None
+        )
+        cap = sp_route_capture(sp.m, enabled=route_fold)
+        try:
+            with cap:
+                f = ffn.forward_partial(
+                    x, input_ids, routing, defer_shared_add=shr is not None
+                )
+            if routing is not None:
+                sp_moe_codes_done(shared_reads_rows=shr is None)
+        finally:
+            sp_fp8_handoff_clear()
+            if shr is not None:
+                tp_shared._sp_skip = False
+        if shr is None:
+            return sp.reduce_scatter(f)
+        if not isinstance(f, tuple):
+            raise RuntimeError(
+                f"{SP_SHARED_ROWLOCAL_LABEL}: the MoE did not defer the shared add"
+            )
+        # The TP shared expert's placeholder f[0] is dropped.
+        out = sp.reduce_scatter(f[1], route=cap.route)
+        return out.add_(shr)
 
     def _forward_unfused_post_pre(
         self,
@@ -1352,6 +1686,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             vllm_config
         )
         self.use_mega_moe = vllm_config.kernel_config.moe_backend == "aiter_mega_moe"
+        self._sp_moe_requested = _sp_moe_requested(vllm_config)
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -1362,6 +1697,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 fuse_heterogeneous_shared_expert=(
                     self.fuse_heterogeneous_shared_expert
                 ),
+                sp_moe=self._sp_moe_requested,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1413,6 +1749,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self._sp_enabled = vllm_config.attention_config.dsv4_seq_parallel
         self._sp_comm: SeqParallelSeamComm | None = None
         self._sp_logged = False
+        self._sp_moe = False
         if not self._sp_enabled:
             return
         reasons = sp_config_disable_reasons(vllm_config)
@@ -1439,6 +1776,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             SEQ_PARALLEL_MIN_ROWS,
             mbt,
         )
+        self._sp_moe = self._sp_moe_requested
+        if not self._sp_moe:
+            return
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        for layer in layers:
+            layer.sp_moe = True
+        set_rocm_aiter_fused_moe_input_hook(sp_fused_moe_input_hook)
+        logger.info(
+            "%s: MoE on sequence-parallel steps armed on rank %d (router shard, "
+            "MXFP8 codes for the routed experts, full shared expert on own rows "
+            "in %d of %d layers; %s is decided at the first such step)",
+            SP_MOE_LABEL,
+            get_tensor_model_parallel_rank(),
+            sum(layer.ffn.shared_experts_full is not None for layer in layers),
+            len(layers),
+            SP_ROUTE_FOLD_LABEL,
+        )
 
     def _seq_parallel_step(self, num_tokens: int) -> SeqParallelStep | None:
         if not self._sp_enabled or num_tokens < SEQ_PARALLEL_MIN_ROWS:
@@ -1448,10 +1802,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not (get_pp_group().is_first_rank and get_pp_group().is_last_rank):
             return None
         if self._sp_comm is None:
-            from vllm.distributed import get_tp_group
-
             self._sp_comm = SeqParallelSeamComm(
-                get_tp_group(), self._sp_max_rows, self.config.hidden_size
+                get_tp_group(),
+                self._sp_max_rows,
+                self.config.hidden_size,
+                gather_tail_bytes=(
+                    routing_tail_bytes(self.config.num_experts_per_tok)
+                    if self._sp_moe
+                    else 0
+                ),
+                # The slot fold runs only beside the row-local shared expert.
+                route_fold=self._sp_moe
+                and any(
+                    layer.ffn.shared_experts_full is not None
+                    for layer in islice(self.layers, self.start_layer, self.end_layer)
+                ),
             )
         sp = SeqParallelStep(self._sp_comm, num_tokens)
         if sp.mp > self._sp_max_rows:
@@ -1683,6 +2048,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(param_name)
+                full_name = _shared_full_name(param_name)
+                if full_name is not None and full_name in params_dict:
+                    full_param = params_dict[full_name]
+                    full_param.weight_loader(full_param, loaded_weight, shard_id)
+                    loaded_params.add(full_name)
                 break
             else:
                 if ".experts." in name:
@@ -1732,9 +2102,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(param_name)
-                    full_name = _rowlocal_full_name(param_name)
-                    if full_name is not None and full_name in params_dict:
-                        # dsv4_rowlocal_attention: the full (all-head) copy.
+                    # dsv4_rowlocal_attention / dsv4_sp_moe: the full (non-TP)
+                    # copies, present in params_dict only where they exist.
+                    for full_name in (
+                        _rowlocal_full_name(param_name),
+                        _shared_full_name(param_name),
+                    ):
+                        if full_name is None or full_name not in params_dict:
+                            continue
                         full_param = params_dict[full_name]
                         getattr(full_param, "weight_loader", default_weight_loader)(
                             full_param, loaded_weight
@@ -1780,6 +2155,15 @@ def _rowlocal_full_name(param_name: str) -> str | None:
     if m.group(4) is not None:
         return param_name[: m.start()] + m.group(1) + "attn_sink_full"
     return param_name[: m.start()] + f"{m.group(1)}{m.group(2)}_full.{m.group(3)}"
+
+
+def _shared_full_name(param_name: str) -> str | None:
+    """The full shared expert copy's parameter (dsv4_sp_moe) that a shared
+    expert checkpoint tensor also loads into, or None. params_dict has it only
+    where the copy exists."""
+    if ".ffn.shared_experts." not in param_name:
+        return None
+    return param_name.replace(".ffn.shared_experts.", ".ffn.shared_experts_full.")
 
 
 def _redirect_shared_expert_name(

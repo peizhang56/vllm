@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from enum import IntEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -355,6 +356,26 @@ def mxfp4_w4a16_extra_kwargs(
     }
 
 
+# fused_moe(x, a1_scale) of one rocm_aiter_fused_experts call.
+FusedMoeRun = Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
+FusedMoeInputHook = Callable[[torch.Tensor, FusedMoeRun], torch.Tensor | None]
+_fused_moe_input_hook: FusedMoeInputHook | None = None
+
+
+def set_rocm_aiter_fused_moe_input_hook(hook: FusedMoeInputHook | None) -> None:
+    """Install (or, with None, remove) `hook(hidden_states, run)`.
+
+    rocm_aiter_fused_experts consults it on dynamically quantized MXFP4 calls.
+    `run(x, a1_scale)` runs that call's fused_moe on activations x with scales
+    a1_scale; the hook returns its output, or None to run on hidden_states as
+    usual. A model that already holds hidden_states as MXFP8 codes and e8m0
+    scales hands them over this way, so fused_moe takes its fp8 passthrough
+    instead of quantizing the bf16 rows again.
+    """
+    global _fused_moe_input_hook
+    _fused_moe_input_hook = hook
+
+
 def rocm_aiter_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -451,40 +472,56 @@ def rocm_aiter_fused_experts(
             else GateMode.SEPARATED.value
         )
 
-    return rocm_aiter_ops.fused_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        expert_mask=expert_mask,
-        quant_method=quant_type.value,
-        activation_method=activation_method,
-        w1_scale=quant_config.w1_scale,
-        w2_scale=quant_config.w2_scale,
-        a1_scale=quant_config.a1_scale if a1q_scale is None else a1q_scale,
-        a2_scale=quant_config.a2_scale,
-        doweight_stage1=apply_router_weight_on_input,
-        num_local_tokens=num_local_tokens,
-        output_dtype=output_dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        gate_mode=gate_mode,
-        bias1=bias1,
-        bias2=bias2,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        swiglu_limit=(
-            0.0 if moe_config.swiglu_limit is None else float(moe_config.swiglu_limit)
-        ),
-        beta=moe_config.activation_situ_beta,
-        linear_beta=moe_config.activation_situ_linear_beta,
-        shared_w1=shared_w1,
-        shared_w2=shared_w2,
-        shared_w1_scale=shared_w1_scale,
-        shared_w2_scale=shared_w2_scale,
-        shared_expert_id=shared_expert_id,
-        q_dtype_a=q_dtype_a,
-    )
+    def run(x: torch.Tensor, a1_scale: torch.Tensor | None) -> torch.Tensor:
+        return rocm_aiter_ops.fused_moe(
+            x,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            expert_mask=expert_mask,
+            quant_method=quant_type.value,
+            activation_method=activation_method,
+            w1_scale=quant_config.w1_scale,
+            w2_scale=quant_config.w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=quant_config.a2_scale,
+            doweight_stage1=apply_router_weight_on_input,
+            num_local_tokens=num_local_tokens,
+            output_dtype=output_dtype,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            gate_mode=gate_mode,
+            bias1=bias1,
+            bias2=bias2,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            swiglu_limit=(
+                0.0
+                if moe_config.swiglu_limit is None
+                else float(moe_config.swiglu_limit)
+            ),
+            beta=moe_config.activation_situ_beta,
+            linear_beta=moe_config.activation_situ_linear_beta,
+            shared_w1=shared_w1,
+            shared_w2=shared_w2,
+            shared_w1_scale=shared_w1_scale,
+            shared_w2_scale=shared_w2_scale,
+            shared_expert_id=shared_expert_id,
+            q_dtype_a=q_dtype_a,
+        )
+
+    a1_scale = quant_config.a1_scale if a1q_scale is None else a1q_scale
+    hook = _fused_moe_input_hook
+    if (
+        hook is not None
+        and a1_scale is None
+        and quant_type == AiterQuantType.BLOCK_1X32
+        and shared_expert_id == -1
+    ):
+        out = hook(hidden_states, run)
+        if out is not None:
+            return out
+    return run(hidden_states, a1_scale)
 
 
 class AiterExperts(mk.FusedMoEExpertsModular):
