@@ -1617,9 +1617,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if attn_config.dsv4_rowlocal_attention and attn_config.dsv4_rowlocal_input:
             # Row-local steps score each rank's own rows of the FP8 indexer
             # instead of its ShardQ split (see PrefillRowShard.rowlocal).
+            # Layers without the full attention weights never run row-local.
             for layer in self.layers[self.start_layer:self.end_layer]:
                 indexer = getattr(layer.attn, "indexer", None)
-                if indexer is None or indexer.use_fp4_kv:
+                if (
+                    indexer is None
+                    or indexer.use_fp4_kv
+                    or not getattr(layer.attn, "_rowlocal_full", False)
+                ):
                     continue
                 k_cache = indexer.k_cache
                 if getattr(k_cache, "use_shardq", False):
