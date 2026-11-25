@@ -1312,6 +1312,12 @@ class FusedMoEConfig:
     # Only honored on the non-reduced (late-AR) TP path. Default False.
     skip_final_all_reduce: bool = False
 
+    # When True (only together with skip_final_all_reduce), the runner returns the shared and
+    # the routed expert outputs as a pair instead of their sum, so the caller can handle the shared
+    # term separately (the DSv4 sequence-parallel seam runs the shared expert on its own rows and
+    # reduce-scatters the routed term only). Requested per call, after construction. Default False.
+    defer_shared_add: bool = False
+
     # Requested through `defer_moe_finalize()`, read through
     # `should_defer_moe_finalize()`.
     _defer_moe_finalize: bool = field(default=False, init=False)

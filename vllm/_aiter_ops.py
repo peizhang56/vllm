@@ -2099,7 +2099,11 @@ def _sync_aiter_situv2_moe_env() -> None:
             os.environ.pop(name, None)
 
 
-_GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN = 64 * 1024
+# Measured on AITER 0.1.26 (gfx950, fp32 logits, k=1024, CUDA graph): AITER
+# decode top-k beats the in-tree kernel 2.2-5x at 14-280 rows up to 131k
+# compressed keys and stays within 1.17x of it at 262k (the FULL-graph bound
+# for a 1M-token max_model_len). The 64k bound was measured on v0.1.19.
+_GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN = 256 * 1024
 _GFX950_C4A_NATIVE_MAX_ROWS = 256
 _GFX950_DSV4_NATIVE_MAX_COLUMNS = 1024 * 1024
 _GFX950_DSA_AITER_MIN_PREFILL_SEQ_LEN = 32 * 1024
@@ -2910,9 +2914,9 @@ class rocm_aiter_ops:
 
         if not is_prefill:
             assert max_valid_seq_len is not None
-            # AITER v0.1.19 decode is one-block only. This measured gfx950
-            # FP32/k=1024 compressed-row boundary is independent of the native
-            # split-count boundary in sampler.cu.
+            # Measured gfx950 FP32/k=1024 compressed-row boundary (see the
+            # constant); independent of the native split-count boundary in
+            # sampler.cu.
             if (
                 num_rows <= _GFX950_C4A_NATIVE_MAX_ROWS
                 and max_valid_seq_len > _GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN

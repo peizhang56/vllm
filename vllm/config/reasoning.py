@@ -3,6 +3,8 @@
 
 from dataclasses import field
 
+from pydantic import Field
+
 from vllm.config.model import ModelConfig
 from vllm.config.utils import config
 from vllm.reasoning import ReasoningParserManager
@@ -25,6 +27,11 @@ class ReasoningConfig:
     """String that indicates the start of reasoning."""
     reasoning_end_str: str = ""
     """String forced when the thinking budget is exhausted."""
+    thinking_budget_reserve: int | None = Field(default=None, ge=0)
+    """Responses API: reserve this many output tokens for the answer. A request's
+    thinking budget is then max_output_tokens - thinking_budget_reserve when
+    max_output_tokens is larger, so the model closes its reasoning with
+    reasoning_end_str before the output cap. None (default): no server-side budget."""
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False

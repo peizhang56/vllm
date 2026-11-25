@@ -22,6 +22,7 @@ from vllm.config import (
     set_current_vllm_config,
     update_config,
 )
+from vllm.config.attention import set_active_attention_config
 from vllm.config.compilation import CompilationMode
 from vllm.config.profiler import validate_profile_prefix
 from vllm.device_allocator import get_mem_allocator_instance
@@ -447,6 +448,7 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        set_active_attention_config(self.vllm_config.attention_config)
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

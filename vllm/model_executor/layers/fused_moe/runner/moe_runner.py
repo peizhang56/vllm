@@ -290,6 +290,12 @@ class MoERunner(MoERunnerInterface):
                 mk_can_overlap_shared_experts=can_overlap,
             )
 
+        # Routing supplied by the caller for the next forward only, as (topk_weights,
+        # topk_ids) over all rows (already router-post-processed). When set, the gate and
+        # select_experts are skipped. Used by the ROCm DSv4 sequence-parallel step, which
+        # routes each rank's row slice and all-gathers the result.
+        self._precomputed_routing: tuple[torch.Tensor, torch.Tensor] | None = None
+
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
@@ -617,6 +623,9 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        precomputed = self._precomputed_routing
+        if precomputed is not None and self.routed_experts.quant_method.is_monolithic:
+            raise RuntimeError("precomputed routing needs a modular MoE kernel")
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
             router_logits = self.router.prepare_monolithic_logits(router_logits)
@@ -627,12 +636,17 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if precomputed is not None:
+                topk_weights, topk_ids = precomputed
+                assert topk_ids.shape[0] == hidden_states.shape[0], (
+                    topk_ids.shape, hidden_states.shape)
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -692,7 +706,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Invoke the fused moe layer.
 
         Input:
@@ -785,6 +799,21 @@ class MoERunner(MoERunnerInterface):
 
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
+
+        if shared_output is not None and self.moe_config.defer_shared_add:
+            # defer_shared_add: the caller adds the two terms itself (DSv4 sequence parallel adds its
+            # row-local shared expert after the reduce-scatter). Everything
+            # skipped here (the add, the final all-reduce, the zero-expert term, the trim) must be
+            # a no-op on this path, so refuse the configurations where it is not.
+            if not self.moe_config.skip_final_all_reduce:
+                raise RuntimeError("defer_shared_add requires skip_final_all_reduce")
+            if og_hidden_dim_post_xform is not None or isinstance(
+                self.router, ZeroExpertRouter
+            ):
+                raise RuntimeError(
+                    "defer_shared_add does not support a trimmed output or a zero expert"
+                )
+            return shared_output, fused_output
 
         if shared_output is not None:
             result = shared_output + fused_output
@@ -904,7 +933,7 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        if self.gate is not None and self._precomputed_routing is None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = dispatch_unquantized_gemm()(

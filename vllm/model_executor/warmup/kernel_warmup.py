@@ -236,6 +236,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
+    if current_platform.is_rocm():
+        from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
+            sp_compressor_shard_warmup,
+        )
+
+        sp_compressor_shard_warmup(worker)
     step5_dsa_warmup(worker)
 
     # Deep GEMM warmup

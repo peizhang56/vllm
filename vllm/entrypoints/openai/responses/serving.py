@@ -152,6 +152,11 @@ class OpenAIServingResponses(GenerateBaseServing):
         self.enable_per_request_metrics = enable_per_request_metrics
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        # P1: --reasoning-config thinking_budget_reserve (None: no server-side thinking budget)
+        _reasoning_config = engine_client.vllm_config.reasoning_config
+        self.thinking_budget_reserve = (
+            _reasoning_config.thinking_budget_reserve if _reasoning_config is not None else None
+        )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -437,7 +442,8 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
 
             sampling_params = request.to_sampling_params(
-                default_max_tokens, self.default_sampling_params
+                default_max_tokens, self.default_sampling_params,
+                thinking_budget_reserve=self.thinking_budget_reserve,
             )
 
             trace_headers = (

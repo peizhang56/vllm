@@ -110,7 +110,23 @@ class AttentionConfig:
 
     indexer_tp_shard_min_rows: int = Field(default=65536, ge=1)
     """Minimum total prefill rows for the sparse-attention indexer to split
-    them across TP ranks instead of scoring every row on each rank."""
+    them across TP ranks instead of scoring every row on each rank (CUDA)."""
+
+    sparse_mla_shard_q: bool = True
+    """Under tensor parallelism, shard the sparse-attention indexer prefill by
+    token: each TP rank scores its zigzag slice of the prefill tokens and the
+    ranks all-gather the int32 top-k back into token order. On ROCm,
+    DeepSeek-V4 and V4.1 shard only their indexer prefill this way; their
+    attention stays sharded by head. On DeepSeek-V4 steps that run
+    sequence-parallel with row-local attention (`dsv4_rowlocal_input`), each
+    rank scores its own sequence-parallel rows instead and nothing is
+    exchanged. Off under DCP or PCP, and when the mixed CUDA-graph mode is
+    FULL."""
+
+    sparse_mla_shard_q_min_tokens: int = Field(default=1024, ge=1)
+    """Minimum number of tokens after a step's decodes (requests of at most
+    1 + num_speculative_tokens tokens) for `sparse_mla_shard_q` to apply. Below
+    it the exchange can cost more than it saves."""
 
     minimax_m3_indexer_cp: bool = False
     """MiniMax M3 on ROCm with tensor_parallel_size > 1: score the sparse
@@ -127,6 +143,36 @@ class AttentionConfig:
     Model Runner V2-only HiSparse sparse-MLA decode hot-buffering. It is inferred
     with defaults when HiSparseConnector is configured (directly or via
     MultiConnector); set it explicitly only to tune its fields."""
+
+    dsv4_seq_parallel: bool = False
+    """DeepSeek-V4 on ROCm gfx950 (TP8): sequence-parallel mHC seams on steps of at
+    least 1024 rows (INT4 reduce-scatter, fp8 gather, and the router, compressor
+    and reduce folds). Ignored, with the reasons logged, when the deployment cannot
+    run it. No effect on other models."""
+
+    dsv4_rowlocal_attention: bool = False
+    """DeepSeek-V4 on ROCm: row-local attention on sequence-parallel steps. Each rank
+    loads the full wq_b, wo_a and wo_b (about 15 GiB of KV cache per GPU). Needs
+    dsv4_seq_parallel."""
+
+    dsv4_rowlocal_input: bool = False
+    """DeepSeek-V4 on ROCm: on a row-local sequence-parallel step, skip the attention
+    layer-input gather and score the indexer prefill on the rank's own rows
+    instead of its `sparse_mla_shard_q` split. Needs dsv4_rowlocal_attention and
+    sparse_mla_shard_q."""
+
+    dsv4_attn_e8m0: bool = False
+    """DeepSeek-V4 on ROCm: e8m0 scale route for the attention GEMMs (FlyDSL mxscale
+    bpreshuffle, gfx950)."""
+
+    dsv4_sp_self_check: bool = False
+    """Debug only: one-time bitwise self-checks of the sequence-parallel path against
+    the unfused path. A check that fails on one rank raises there while the other
+    ranks wait in the next collective."""
+
+    kv_zero_coalesce: bool = False
+    """Zero each newly allocated KV block's bytes once instead of once per overlapping
+    per-layer page. Exact: the same kernel writes the same bytes."""
 
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""
@@ -261,3 +307,21 @@ class AttentionConfig:
                 backend = AttentionBackendEnum[backend.upper()]
             parsed[kind] = backend
         return parsed
+
+
+# The DeepSeek-V4 switches above are read by the model code through the attention config of
+# the worker process (set in Worker.init_device before the model is built). They are not
+# environment variables.
+_active_attention_config: AttentionConfig | None = None
+
+
+def set_active_attention_config(cfg: AttentionConfig) -> None:
+    global _active_attention_config
+    _active_attention_config = cfg
+
+
+def active_attention_config() -> AttentionConfig:
+    """The attention config of this process (defaults if none was set)."""
+    if _active_attention_config is not None:
+        return _active_attention_config
+    return AttentionConfig()

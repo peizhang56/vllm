@@ -569,6 +569,7 @@ class ResponsesRequest(OpenAIBaseModel):
         self,
         default_max_tokens: int,
         default_sampling_params: dict | None = None,
+        thinking_budget_reserve: int | None = None,
     ) -> SamplingParams:
         if self.max_output_tokens is None:
             max_tokens = default_max_tokens
@@ -617,7 +618,14 @@ class ResponsesRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             extra_args["ec_transfer_params"] = self.ec_transfer_params
 
+        # Server-side thinking budget (P1): --reasoning-config thinking_budget_reserve.
+        thinking_token_budget = None
+        reserve = thinking_budget_reserve
+        if reserve is not None and max_tokens is not None and max_tokens > reserve:
+            thinking_token_budget = max_tokens - reserve
+
         return SamplingParams.from_optional(
+            thinking_token_budget=thinking_token_budget,
             temperature=temperature,
             watermarking=self.watermarking,
             top_p=top_p,

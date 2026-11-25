@@ -14,6 +14,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
+from vllm.config.attention import active_attention_config
 from vllm.distributed import (
     get_dcp_group,
     get_pcp_group,
@@ -365,6 +366,40 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+# m-attn-rowlocal step 2b (indexer half). Behind dsv4_rowlocal_input=1
+# (only acts together with dsv4_rowlocal_attention=1): on a row-local
+# sequence-parallel step each rank's sparse MLA reads the top-k of its own SP
+# rows [start, start + s) only, so each rank scores exactly those prefill rows,
+# in place, and nothing is exchanged. The indexer builder marks such steps
+# (shardq_rowlocal_rows) instead of giving them a ShardQ split. Rows are
+# independent, so each row's index set is the one the replicated path
+# computes. Decode rows are untouched.
+ROWLOCAL_INDEXER_LABEL = "dsv4_rowlocal_input"
+_ROWLOCAL_INDEXER_LOGGED = [False]
+# (start, s): this rank's SP rows on the current row-local step, else None.
+_ROWLOCAL_ROWS: "tuple[int, int] | None" = None
+
+
+def set_rowlocal_rows(rows: "tuple[int, int] | None") -> None:
+    """Set (start, s) of this rank's SP rows around a row-local attention call."""
+    global _ROWLOCAL_ROWS
+    _ROWLOCAL_ROWS = rows if active_attention_config().dsv4_rowlocal_input else None
+
+
+def _rowlocal_sizes(num_decode_tokens: int, num_prefill: int, start: int,
+                    s: int, world: int) -> list[int]:
+    """Prefill rows of each rank's uniform SP slice [k*s, (k+1)*s) of the step."""
+    m = num_decode_tokens + num_prefill
+    out = []
+    for k in range(world):
+        lo = min(max(k * s, num_decode_tokens), m)
+        hi = min(max((k + 1) * s, num_decode_tokens), m)
+        out.append(hi - lo)
+    assert num_decode_tokens + sum(out[:get_tensor_model_parallel_rank()]) == min(
+        max(start, num_decode_tokens), m)
+    return out
+
+
 class PrefillRowShard:
     """One TP rank's contiguous slice of the replicated prefill rows.
 
@@ -386,6 +421,33 @@ class PrefillRowShard:
             return None
         return cls(num_decode_tokens, sizes, get_tensor_model_parallel_rank())
 
+    @classmethod
+    def rowlocal(
+        cls, prefill_metadata, num_decode_tokens: int
+    ) -> "PrefillRowShard | None":
+        """This rank's SP rows of a row-local step (see set_rowlocal_rows),
+        scored in place with no exchange; None on other steps."""
+        num_prefill = getattr(prefill_metadata, "shardq_rowlocal_rows", None)
+        rows = _ROWLOCAL_ROWS
+        if (
+            num_prefill is None
+            or rows is None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        rank = get_tensor_model_parallel_rank()
+        start, s = rows
+        sizes = _rowlocal_sizes(
+            num_decode_tokens, num_prefill, start, s, get_tp_group().world_size
+        )
+        if not _ROWLOCAL_INDEXER_LOGGED[0]:
+            _ROWLOCAL_INDEXER_LOGGED[0] = True
+            logger.info(
+                "%s (m-attn-rowlocal step 2b): row-local indexer shard "
+                "dispatched on rank %d (prefill rows %s of %d; no top-k "
+                "exchange)", ROWLOCAL_INDEXER_LABEL, rank, sizes, num_prefill)
+        return cls(num_decode_tokens, sizes, rank)
+
     def narrow(self, chunk) -> "tuple[int, int, torch.Tensor, torch.Tensor] | None":
         """Row window and narrowed causal bounds of ``chunk`` for this rank."""
         start = max(chunk.token_start, self.start)
@@ -394,6 +456,16 @@ class PrefillRowShard:
             return None
         lo, hi = start - chunk.token_start, end - chunk.token_start
         return start, end, chunk.cu_seqlen_ks[lo:hi], chunk.cu_seqlen_ke[lo:hi]
+
+    def compact_rows(self, t: torch.Tensor) -> torch.Tensor:
+        """Rows [0, num_decode_tokens) U [start, stop) of ``t``, in that order.
+
+        The layout of a query computed for this rank's rows only: decode rows
+        first (they stay replicated), then this rank's prefill window."""
+        nd = self.num_decode_tokens
+        if nd == 0:
+            return t[self.start : self.stop]
+        return torch.cat((t[:nd], t[self.start : self.stop]), dim=0)
 
     def exchange_topk(self, topk_buffer: torch.Tensor, width: int) -> None:
         """Gather per-rank final indices back into global row order."""
@@ -1046,6 +1118,9 @@ class SparseAttnIndexer(CustomOp):
         self.candidate_block_size = candidate_block_size
         self.candidate_write = candidate_write
         self.dense_mha_metadata_layer_name = ""
+        # Set per step by the model's indexer when it computed the query only
+        # for decode rows + this rank's row-local prefill rows (ROCm DSv4).
+        self.q_rows_compact = False
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
@@ -1216,6 +1291,7 @@ class SparseAttnIndexer(CustomOp):
                 candidate_blocks=self.candidate_blocks,
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=self.candidate_write,
+                q_rows_compact=self.q_rows_compact,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path requires AITER or a supported "

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
 )
@@ -1142,10 +1143,46 @@ class DeepseekV4Indexer(nn.Module):
                     )
                 return None, None, None
 
+        row_shard = self._rowlocal_row_shard(attn_metadata, qr_scale)
+        self.indexer_op.q_rows_compact = row_shard is not None
+        q_in, q_in_scale, q_positions, q_weights = (
+            qr,
+            qr_scale,
+            positions,
+            indexer_weights,
+        )
+        qr_compact = getattr(self, "_qr_compact", False)
+        if qr_compact:
+            # m-attn-rowlocal step 2b input (dsv4_rowlocal_input): the caller computed
+            # qr, its scales and the weights for the compact rows only (decode rows, then this
+            # rank's prefill window); the positions are still full-row.
+            assert row_shard is not None, "compact qr needs the row-local row shard"
+            assert qr.shape[0] == row_shard.num_decode_tokens + row_shard.stop - row_shard.start, (
+                qr.shape, row_shard.num_decode_tokens, row_shard.start, row_shard.stop)
+            q_positions = row_shard.compact_rows(positions)
+        elif row_shard is not None:
+            # Each rank scores only its row-local prefill rows (plus the
+            # replicated decode rows), so build the index query for those rows
+            # only; the indexer op reads them at their compact offsets. The
+            # compressor below still sees every row.
+            q_in = row_shard.compact_rows(qr)
+            if qr_scale is not None:
+                q_in_scale = row_shard.compact_rows(qr_scale)
+            q_positions = row_shard.compact_rows(positions)
+            q_weights = row_shard.compact_rows(indexer_weights)
+        elif (rows := self._shardq_query_rows()) is not None:
+            # A ShardQ step scores only this rank's rows: build the query of
+            # just those (the op detects the compact query). The compressor
+            # still sees every row.
+            q_in, q_positions = qr[rows], positions[rows]
+            q_weights = indexer_weights[rows]
+            if qr_scale is not None:
+                q_in_scale = qr_scale[rows]
+
         def wq_b_and_q_quant():
-            q = self._wq_b_proj(qr, qr_scale)
+            q = self._wq_b_proj(q_in, q_in_scale)
             q = q.view(-1, self.n_head, self.head_dim)
-            return self._q_rope_quant(positions, q, rotary_emb, indexer_weights)
+            return self._q_rope_quant(q_positions, q, rotary_emb, q_weights)
 
         if not skip_compressor:
             # compressor returns None and writes K to the indexer KV cache; the
@@ -1164,6 +1201,67 @@ class DeepseekV4Indexer(nn.Module):
         else:
             q, q_scale = q_quant, None
         return q, q_scale, weights
+
+    def _rowlocal_metadata(self, attn_metadata, qr_scale: torch.Tensor | None):
+        """This layer's indexer metadata when the step is row-local
+        (shardq_rowlocal_rows) and the index query may be computed for the
+        decode rows + this rank's row-local prefill rows only, else None.
+
+        Only the ROCm FP8 indexer op (rocm_aiter_sparse_attn_indexer) reads a
+        row-local compact query. Padded decode (requires_padding) reads
+        weights past the decode rows, so it keeps the full layout."""
+        if (
+            not current_platform.is_rocm()
+            or self.use_fp4_kv
+            or type(self.indexer_op) is not SparseAttnIndexer
+            or self.indexer_op.candidate_blocks is not None
+            or not isinstance(attn_metadata, dict)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        if qr_scale is not None and not qr_scale.is_contiguous():
+            return None
+        meta = attn_metadata.get(self.k_cache.prefix)
+        prefill = getattr(meta, "prefill", None)
+        if prefill is None or getattr(prefill, "shardq_rowlocal_rows", None) is None:
+            return None
+        decode = getattr(meta, "decode", None)
+        if decode is not None and decode.requires_padding:
+            return None
+        return meta
+
+    def _rowlocal_row_shard(self, attn_metadata, qr_scale: torch.Tensor | None):
+        """This rank's row-local PrefillRowShard inside a row-local attention
+        call (set_rowlocal_rows) on a row-local step, else None."""
+        meta = self._rowlocal_metadata(attn_metadata, qr_scale)
+        if meta is None:
+            return None
+        from vllm.model_executor.layers.sparse_attn_indexer import PrefillRowShard
+
+        return PrefillRowShard.rowlocal(meta.prefill, meta.num_decode_tokens)
+
+    def _shardq_query_rows(self) -> torch.Tensor | None:
+        """The rows a ShardQ step scores on this rank (decode rows, then this
+        rank's prefill tokens; see shardq_gather_indices) when the index K
+        cache is marked `shardq_compact_query`, else None. Also None in
+        cudagraph capture or replay, which would bake in the rows, and with
+        padded decode rows, which the op reads past the decode tokens."""
+        if not getattr(self.k_cache, "shardq_compact_query", False):
+            return None
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if (
+            not isinstance(attn_metadata, dict)
+            or forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        metadata = attn_metadata[self.k_cache.prefix]
+        if metadata.prefill is None or (
+            metadata.decode is not None and metadata.decode.requires_padding
+        ):
+            return None
+        return metadata.prefill.shardq_gather_indices
 
     def _wq_b_proj(
         self, qr: torch.Tensor, qr_scale: torch.Tensor | None = None
