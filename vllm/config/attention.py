@@ -175,6 +175,14 @@ class AttentionConfig:
     all-gathered as fp8 with 1x128 scales. Ignored, with the reasons logged,
     when the deployment cannot run it. No effect on other models."""
 
+    dsv4_rowlocal_attention: bool = False
+    """DeepSeek-V4 on ROCm, with `dsv4_seq_parallel`: on sequence-parallel
+    steps each rank runs the attention of all heads on its own 1/8 of the rows
+    and the attention reduce-scatter is skipped. Each rank holds full copies of
+    wq_b, wo_a, wo_b and attn_sink, which costs about 15 GiB of KV cache per
+    GPU. Ignored, with the reasons logged, when sequence parallelism cannot
+    engage."""
+
     dsv4_sp_self_check: bool = False
     """Debug only: one-time bitwise self-checks of the `dsv4_seq_parallel` fp8
     handoff against the requantizing path. A check that fails on one rank

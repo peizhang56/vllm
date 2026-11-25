@@ -11,6 +11,7 @@ from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -32,6 +33,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_kernel_dispatcher_with_warmup,
 )
 from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
+    SeqParallelStep,
+    sp_config_disable_reasons,
     sp_fp8_form,
     sp_fp8_handoff_check,
 )
@@ -930,6 +933,33 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
         return DeepseekV4ROCMAiterMLASparseMetadataBuilder
 
 
+# dsv4_rowlocal_attention: every backbone attention layer also holds the full
+# (all-head) wq_b / wo_a / wo_b and attn_sink, which row-local attention (each
+# rank runs all heads on its own Mp/8 rows of a sequence-parallel step) reads.
+# The TP shards of wq_b and wo_a become row views of the full weights (same
+# bytes and stride, checked at load), so every TP path, the mono decode kernel
+# included, reads byte-identical tensors. wo_b's TP shard is a column slice that
+# the mono decode kernel needs contiguous, so the full wo_b is an extra copy
+# (checked equal to the shard before either is shuffled).
+ATTN_ROWLOCAL_LABEL = "dsv4_rowlocal_attention"
+# One dispatch line per rank.
+_ATTN_ROWLOCAL_LOGGED = [False]
+# Compress ratios whose row-local sparse MLA variants are compiled.
+_ROWLOCAL_WARMED: set[int] = set()
+# Compress ratios whose windowed prefill top-k stream was logged.
+_ROWLOCAL_RAGGED_WINDOW_LOGGED: set[int] = set()
+
+
+def _bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Same shape, stride, dtype and bytes."""
+    return (
+        a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+        and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    )
+
+
 class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
@@ -937,6 +967,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     # Set by the decoder layer around a sequence-parallel step (dsv4_seq_parallel):
     # return wo_b's TP partial sum; the caller reduce-scatters it.
     _sp_defer_reduce = False
+    # Set by the decoder layer around a sequence-parallel step when
+    # rowlocal_ready(): forward then returns this rank's Mp/8 rows of the full
+    # (all-head) attention output, which need no reduce.
+    _sp_rowlocal: SeqParallelStep | None = None
 
     def _get_indexer_cls(self, vllm_config: VllmConfig) -> type[DeepseekV4Indexer]:
         if dsa_indexer_uses_fp4(vllm_config):
@@ -977,6 +1011,141 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         )
         if self._plain_fp8_kv:
             _register_plain_fp8_kv_scales(self, self._use_aiter_sparse_mla_decode)
+        # dsv4_rowlocal_attention: the full-head weights (unset unless loaded).
+        self._rowlocal_full = False
+        self._rowlocal_ok: bool | None = None
+        self._rowlocal_added_bytes = 0
+        self._wo_b_full_scale: torch.Tensor | None = None
+        self._wo_a_full_fp8_weight: torch.Tensor | None = None
+        self._wo_a_full_e8m0_scale: torch.Tensor | None = None
+        if vllm_config.attention_config.dsv4_rowlocal_attention:
+            self._init_rowlocal_full(vllm_config)
+
+    def _init_rowlocal_full(self, vllm_config: VllmConfig) -> None:
+        """Register the full wq_b / wo_a / wo_b / attn_sink of a backbone
+        layer. Layers without a compressor and draft / MTP layers are left
+        alone. The copies cost about 15 GiB of KV cache per GPU, so they load
+        only if sequence parallelism can engage and rowlocal_ready() can hold.
+        """
+        from vllm.model_executor.layers.linear import ReplicatedLinear
+        from vllm.model_executor.model_loader.weight_utils import (
+            default_weight_loader,
+        )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        config = vllm_config.model_config.hf_config
+        if (
+            get_tensor_model_parallel_world_size() == 1
+            or self.compress_ratio <= 1
+            or extract_layer_index(self.prefix) >= config.num_hidden_layers
+        ):
+            return
+        if not vllm_config.attention_config.dsv4_seq_parallel:
+            reasons = ["needs dsv4_seq_parallel"]
+        else:
+            reasons = sp_config_disable_reasons(vllm_config)
+        if not (
+            self._use_aiter_sparse_mla_decode and self._use_aiter_sparse_mla_prefill
+        ):
+            reasons.append("the AITER sparse MLA kernel is off")
+        if self._plain_fp8_kv:
+            reasons.append("--kv-cache-dtype fp8_e4m3")
+        if not (_ON_GFX950 and envs.VLLM_ROCM_USE_AITER_FP8BMM):
+            reasons.append("no gfx950 FP8 wo_a BMM (VLLM_ROCM_USE_AITER_FP8BMM)")
+        if reasons:
+            logger.warning_once(
+                "%s ignored, full attention weights not loaded: %s",
+                ATTN_ROWLOCAL_LABEL,
+                ", ".join(reasons),
+            )
+            return
+        quant_config = vllm_config.quant_config
+        self.wq_b_full = ReplicatedLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{self.prefix}.wq_b_full",
+        )
+        self.wo_a_full = ReplicatedLinear(
+            self.n_heads * self.head_dim // self.n_groups,
+            self.n_groups * self.o_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{self.prefix}.wo_a_full",
+        )
+        self.wo_a_full.is_bmm = True
+        self.wo_a_full.bmm_batch_size = self.n_groups
+        self.wo_b_full = ReplicatedLinear(
+            self.n_groups * self.o_lora_rank,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{self.prefix}.wo_b_full",
+        )
+        sink = torch.nn.Parameter(
+            torch.full((self.n_heads,), -float("inf"), dtype=torch.float32),
+            requires_grad=False,
+        )
+        sink.weight_loader = default_weight_loader
+        self.attn_sink_full = sink
+        self._rowlocal_full = True
+
+    def _prepare_rowlocal_full(self) -> int:
+        """Turn the TP wq_b / wo_a shards into row views of the full weights
+        after a bytewise check, and check wo_b's shard against the full wo_b's
+        columns (before either is shuffled). Returns the bytes the full weights
+        add. Raises if a shard differs."""
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            get_fp8_block_weight_scale,
+        )
+
+        rank = get_tensor_model_parallel_rank()
+        tp = get_tensor_model_parallel_world_size()
+        added = 0
+        for name in ("wq_b", "wo_a"):
+            part, full = getattr(self, name), getattr(self, f"{name}_full")
+            pw, fw = part.weight, full.weight
+            ps, fs = get_fp8_block_weight_scale(part), get_fp8_block_weight_scale(full)
+            assert ps is not None and fs is not None
+            n, ns = pw.shape[0], ps.shape[0]
+            assert fw.shape[0] == n * tp and fs.shape[0] == ns * tp
+            vw = fw.data[rank * n : (rank + 1) * n]
+            vs = fs.data[rank * ns : (rank + 1) * ns]
+            if not (_bytes_equal(pw.data, vw) and _bytes_equal(ps.data, vs)):
+                raise RuntimeError(
+                    f"{ATTN_ROWLOCAL_LABEL}: {self.prefix}.{name} TP shard differs "
+                    f"from the full weight's rows on rank {rank}"
+                )
+            # Rebind (replace_parameter would copy into the shard's storage).
+            pw.data = vw
+            ps.data = vs
+            added += (fw.numel() - vw.numel()) * fw.element_size()
+            added += (fs.numel() - vs.numel()) * fs.element_size()
+        pw, fw = self.wo_b.weight, self.wo_b_full.weight
+        ps = get_fp8_block_weight_scale(self.wo_b)
+        fs = get_fp8_block_weight_scale(self.wo_b_full)
+        assert ps is not None and fs is not None
+        # Pre-processed weights arrive shuffled, where a column slice is not
+        # the shard's layout.
+        if not is_weights_pre_processed():
+            k, ks = pw.shape[1], ps.shape[1]
+            if not (
+                torch.equal(
+                    pw.data.view(torch.uint8),
+                    fw.data[:, rank * k : (rank + 1) * k].view(torch.uint8),
+                )
+                and torch.equal(ps.data, fs.data[:, rank * ks : (rank + 1) * ks])
+            ):
+                raise RuntimeError(
+                    f"{ATTN_ROWLOCAL_LABEL}: {self.prefix}.wo_b TP shard differs "
+                    f"from the full weight's columns on rank {rank}"
+                )
+        added += fw.numel() * fw.element_size() + fs.numel() * fs.element_size()
+        return added
 
     def _uses_fp8_ds_mla_layout(self) -> bool:
         return get_current_vllm_config().cache_config.cache_dtype != "fp8_e4m3"
@@ -1015,6 +1184,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        sp_rowlocal = self._sp_rowlocal
+        if sp_rowlocal is not None:
+            return self._forward_rowlocal(positions, hidden_states, sp_rowlocal)
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
         num_tokens = hidden_states.shape[0]
@@ -1047,6 +1219,447 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
+
+    # dsv4_rowlocal_attention: on a sequence-parallel step each rank runs the
+    # attention core for all heads on its own Mp/8 rows. The input side is the
+    # TP one (layer input gathered to M rows, fused_wqa_wkv, SWA KV insert,
+    # compressors and indexer on all M rows, so every rank's caches and top-k
+    # lists hold every row); from wq_b on, only the rank's rows run: full wq_b,
+    # q norm + RoPE, sparse MLA in 64-head launches over the rank's slice of the
+    # ragged SWA / top-k lists, full wo_a and full-K wo_b. The output is this
+    # rank's rows of the attention output, so the attention reduce-scatter (and
+    # its INT4 rounding) is skipped.
+    def rowlocal_ready(self) -> bool:
+        """Whether this layer runs row-local on the current sequence-parallel
+        step. The same answer on every rank."""
+        ok = self._rowlocal_ok
+        if ok is None:
+            ok = (
+                self._rowlocal_full
+                and self.compressor is not None
+                and self._use_aiter_sparse_mla_decode
+                and self._use_aiter_sparse_mla_prefill
+                and self._wo_a_fp8_weight is not None
+                and self._wo_a_full_fp8_weight is not None
+                and self._wo_a_full_e8m0_scale is not None
+                and self._wo_b_full_scale is not None
+                and self._wq_b_uses_aiter_block_scaled
+                and self.n_heads % 64 == 0
+            )
+            if ok:
+                # The SWA cache is bound after the memory-profile run: check
+                # it on every call until it is there, and cache only a settled
+                # answer (an fp8_ds_mla paged cache, or another layout).
+                cache = self.swa_cache_layer.kv_cache
+                if not torch.is_tensor(cache) or cache.numel() == 0:
+                    return False
+                ok = cache.dtype == torch.uint8
+            self._rowlocal_ok = ok
+        # Dummy runs carry no attention metadata; they take the TP path.
+        return ok and isinstance(get_forward_context().attn_metadata, dict)
+
+    def _forward_rowlocal(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        sp: SeqParallelStep,
+    ) -> torch.Tensor:
+        attn_metadata = get_forward_context().attn_metadata
+        assert isinstance(attn_metadata, dict)
+        m = hidden_states.shape[0]
+        a = min(sp.start, m)
+        b = min(sp.start + sp.s, m)
+        n = b - a
+        # The input side of _run_sequential_pipeline, streams off.
+        aux_streams = self.aux_stream_list
+        self.aux_stream_list = None
+        try:
+            qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+                self._run_parallel_input_projections(hidden_states)
+            )
+            qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+            assert qr_scale is not None, "row-local attention needs the fp8 qr"
+            q = None
+            if n > 0:
+                q = apply_pre_quantized_block_scaled_mm(
+                    self.wq_b_full, qr[a:b], qr_scale[a:b]
+                ).view(n, self.n_heads, self.head_dim)
+            q = self._rowlocal_qnorm_rope_kv_insert(
+                q, kv, positions, a, b, attn_metadata
+            )
+            index_q = index_q_scale = index_weights = None
+            if self.indexer is not None:
+                assert indexer_weights is not None
+                index_q, index_q_scale, index_weights = self.indexer(
+                    hidden_states,
+                    qr,
+                    indexer_kv_score,
+                    indexer_weights,
+                    positions,
+                    self.indexer_rotary_emb,
+                    qr_scale,
+                )
+            assert self.compressor is not None
+            self.compressor(kv_score, positions, self.rotary_emb)
+            if self.indexer is not None and index_q is not None:
+                assert index_weights is not None
+                q_quant = (
+                    (index_q, index_q_scale) if index_q_scale is not None else index_q
+                )
+                # Fills the top-k rows of every token; this rank reads [a, b).
+                self.indexer.indexer_op(hidden_states, q_quant, None, index_weights)
+        finally:
+            self.aux_stream_list = aux_streams
+        out = hidden_states.new_zeros((sp.s, self.hidden_size)) if n < sp.s else None
+        if q is not None:
+            y = self._rowlocal_attn_out(q, a, b, attn_metadata, positions)
+            if out is None:
+                out = y
+            else:
+                out[:n].copy_(y)
+        assert out is not None
+        if not _ATTN_ROWLOCAL_LOGGED[0]:
+            _ATTN_ROWLOCAL_LOGGED[0] = True
+            logger.info(
+                "%s: row-local attention dispatched on rank %d (%s: rows [%d, %d) "
+                "of %d, %d heads, full wq_b/wo_a/wo_b, no attention "
+                "reduce-scatter)",
+                ATTN_ROWLOCAL_LABEL,
+                get_tensor_model_parallel_rank(),
+                self.prefix,
+                a,
+                b,
+                m,
+                self.n_heads,
+            )
+        return out
+
+    def _rowlocal_qnorm_rope_kv_insert(
+        self,
+        q: torch.Tensor | None,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        a: int,
+        b: int,
+        attn_metadata: dict[str, Any],
+    ) -> torch.Tensor | None:
+        """KV RoPE + quant + SWA insert for all M rows (every rank's cache
+        holds every row); q norm + RoPE only for rows [a, b). Rows outside go
+        through the same kernel with a zero-head q, so the cache bytes are
+        those of the TP path's single call."""
+        swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+        assert swa_metadata is not None
+        assert positions.dtype == torch.int64
+        cache = self.swa_cache_layer.kv_cache
+        cache_2d = cache.view(cache.shape[0], -1)
+        slot = swa_metadata.slot_mapping
+        cos_sin = self.rotary_emb.cos_sin_cache
+        bs = swa_metadata.block_size
+        op = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+        m = kv.shape[0]
+        qo = None
+        if q is not None:
+            qo = op(
+                q,
+                kv[a:b],
+                cache_2d,
+                slot[a:b],
+                positions[a:b],
+                cos_sin,
+                self.n_heads,
+                self.eps,
+                bs,
+            )
+        for lo, hi in ((0, a), (b, m)):
+            if hi > lo:
+                no_q = kv.new_empty((hi - lo, 0, self.head_dim))
+                op(
+                    no_q,
+                    kv[lo:hi],
+                    cache_2d,
+                    slot[lo:hi],
+                    positions[lo:hi],
+                    cos_sin,
+                    0,
+                    self.eps,
+                    bs,
+                )
+        return qo
+
+    def _rowlocal_sparse(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        swa_idx: torch.Tensor,
+        swa_ptr: torch.Tensor,
+        k_cache: torch.Tensor,
+        tk_idx: torch.Tensor,
+        tk_ptr: torch.Tensor,
+    ) -> None:
+        """64-head sparse MLA launches for one decode or prefill row range."""
+        from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+
+        swa_cache = self.swa_cache_layer.kv_cache
+        # The row slices of the step's indptr start at any int32 offset; Triton
+        # specializes pointer arguments on 16-byte alignment, so give each
+        # launch its own (aligned) copy and keep the kernel variants to the
+        # aligned set the warmup compiles.
+        swa_ptr = swa_ptr.clone()
+        tk_ptr = tk_ptr.clone()
+        if self.compress_ratio not in _ROWLOCAL_WARMED:
+            _ROWLOCAL_WARMED.add(self.compress_ratio)
+            self._rowlocal_warmup(swa_cache, k_cache)
+        # Two 64-head launches: 64-head programs at M/8 rows, where one
+        # 128-head launch falls back to 16/32-head programs. One split: each
+        # launch reads its rows' absolute slice of the whole step's index
+        # stream, so the launcher's length average (stream size / rows) would
+        # overstate the split-K need; the TP heuristic gives one split at
+        # >= ~128 rows anyway, and a fixed split keeps the kernel variants to
+        # the set _rowlocal_warmup compiles.
+        for h0 in range(0, self.n_heads, 64):
+            sparse_mla_fwd(
+                q[:, h0 : h0 + 64],
+                swa_cache,
+                swa_ptr,
+                swa_idx,
+                self.scale,
+                kv_splits=1,
+                has_invalid=True,
+                out=o[:, h0 : h0 + 64],
+                attn_sink=self.attn_sink_full[h0 : h0 + 64],
+                extra_kv=k_cache,
+                extra_indptr=tk_ptr,
+                extra_indices=tk_idx,
+            )
+
+    def _rowlocal_warmup(self, swa_cache: torch.Tensor, k_cache: torch.Tensor) -> None:
+        """Compile the 64-head, one-split sparse MLA variants row-local
+        launches can reach for this cache class (block sizes are compile-time):
+        every row count up to a rank's largest share of a step (each crosses the
+        launcher's BLOCK_M / prefill / occupancy thresholds) at three per-row
+        index lengths."""
+        from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+
+        dev = swa_cache.device
+        max_rows = (self.max_num_batched_tokens + 7) // 8 + 128
+        q = torch.zeros((max_rows, 64, self.head_dim), dtype=torch.bfloat16, device=dev)
+        o = torch.empty_like(q)
+        sink = self.attn_sink_full[:64]
+        for per_row in (32, 192, 1024):
+            swa_per_row = min(per_row, 128)
+            idx = torch.zeros(max_rows * per_row, dtype=torch.int32, device=dev)
+            ptr = torch.arange(max_rows + 1, dtype=torch.int32, device=dev) * per_row
+            sidx = torch.zeros(max_rows * swa_per_row, dtype=torch.int32, device=dev)
+            sptr = (
+                torch.arange(max_rows + 1, dtype=torch.int32, device=dev) * swa_per_row
+            )
+            for n in range(1, max_rows + 1):
+                sparse_mla_fwd(
+                    q[:n],
+                    swa_cache,
+                    sptr[: n + 1],
+                    sidx[: n * swa_per_row],
+                    self.scale,
+                    kv_splits=1,
+                    has_invalid=True,
+                    out=o[:n],
+                    attn_sink=sink,
+                    extra_kv=k_cache,
+                    extra_indptr=ptr[: n + 1],
+                    extra_indices=idx[: n * per_row],
+                )
+        torch.accelerator.synchronize(dev)
+        logger.info(
+            "%s: row-local sparse MLA variants warmed on rank %d (C%d caches, "
+            "1..%d rows)",
+            ATTN_ROWLOCAL_LABEL,
+            get_tensor_model_parallel_rank(),
+            self.compress_ratio,
+            max_rows,
+        )
+
+    def _rowlocal_prefill_topk_window(
+        self,
+        rocm_metadata: DeepseekV4ROCMAiterMLASparseMetadata,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        k_cache: torch.Tensor,
+        d: int,
+        r0: int,
+        r1: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The prefill top-k ragged stream for this rank's prefill rows
+        [r0, r1) only (indptr from 0). C128's comes from step metadata, so it
+        is built once per step and reused by every C128 layer of the step."""
+        assert swa_metadata.token_to_req_indices is not None
+        assert swa_metadata.query_start_loc is not None
+        assert swa_metadata.seq_lens is not None
+        assert swa_metadata.is_valid_token is not None
+        num_rows = k_cache.shape[0] * k_cache.shape[1]
+        block_size = rocm_metadata.block_size // self.compress_ratio
+        num_compressed = (
+            self.max_model_len + self.compress_ratio - 1
+        ) // self.compress_ratio
+        key = None
+        if self.compress_ratio == 4:
+            assert self.topk_indices_buffer is not None
+            topk_indices = self.topk_indices_buffer[d + r0 : d + r1]
+        else:
+            assert rocm_metadata.c128a_prefill_topk_indices is not None
+            topk_indices = rocm_metadata.c128a_prefill_topk_indices[r0:r1]
+            # The metadata object is built fresh per step and shared by the
+            # step's C128 layers.
+            key = (self.compress_ratio, d, r0, r1, num_rows, block_size, num_compressed)
+            hit = rocm_metadata.__dict__.get("_rowlocal_topk_window")
+            if hit is not None and hit[0] == key:
+                return hit[1], hit[2]
+        tk_idx, tk_ptr = build_prefill_topk_ragged_indices(
+            topk_indices,
+            swa_metadata.token_to_req_indices,
+            swa_metadata.query_start_loc,
+            swa_metadata.seq_lens,
+            swa_metadata.is_valid_token,
+            rocm_metadata.block_table,
+            block_size=block_size,
+            compress_ratio=self.compress_ratio,
+            num_compressed=num_compressed,
+            token_offset=d + r0,
+            num_rows=num_rows,
+        )
+        if key is not None:
+            rocm_metadata.__dict__["_rowlocal_topk_window"] = (key, tk_idx, tk_ptr)
+        if self.compress_ratio not in _ROWLOCAL_RAGGED_WINDOW_LOGGED:
+            _ROWLOCAL_RAGGED_WINDOW_LOGGED.add(self.compress_ratio)
+            logger.info(
+                "%s: prefill top-k ragged stream built for the rank's rows only "
+                "(C%d%s) on rank %d",
+                ATTN_ROWLOCAL_LABEL,
+                self.compress_ratio,
+                ", once per step" if key is not None else "",
+                get_tensor_model_parallel_rank(),
+            )
+        return tk_idx, tk_ptr
+
+    def _rowlocal_mqa(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        a: int,
+        b: int,
+        attn_metadata: dict[str, Any],
+    ) -> None:
+        """Sparse MLA for rows [a, b). The decode ragged SWA / top-k lists are
+        those the TP path builds for all decode rows, and each launch reads its
+        rows' absolute indptr slice of them; the prefill top-k stream is built
+        for this rank's prefill rows only."""
+        rocm_metadata = cast(
+            DeepseekV4ROCMAiterMLASparseMetadata | None,
+            attn_metadata.get(self.prefix),
+        )
+        swa_metadata = cast(
+            DeepseekV4ROCMAiterSparseSWAMetadata | None,
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None and rocm_metadata is not None
+        k_cache = self.kv_cache
+        d = swa_metadata.num_decode_tokens
+        p = swa_metadata.num_prefill_tokens
+        covered_lo, covered_hi = a, a
+        dlo, dhi = a, min(b, d)
+        if dhi > dlo:
+            assert swa_metadata.decode_swa_ragged_indices is not None
+            assert swa_metadata.decode_swa_ragged_indptr is not None
+            if self.compress_ratio == 4:
+                assert self.topk_indices_buffer is not None
+                assert swa_metadata.token_to_req_indices is not None
+                assert swa_metadata.is_valid_token is not None
+                tk_idx, tk_ptr, _ = compute_global_topk_ragged_indices_and_indptr(
+                    self.topk_indices_buffer[:d],
+                    swa_metadata.token_to_req_indices,
+                    rocm_metadata.block_table[: swa_metadata.num_decodes],
+                    rocm_metadata.block_size // self.compress_ratio,
+                    swa_metadata.is_valid_token[:d],
+                )
+            else:
+                assert rocm_metadata.c128a_decode_topk_ragged_indices is not None
+                assert rocm_metadata.c128a_decode_topk_ragged_indptr is not None
+                tk_idx = rocm_metadata.c128a_decode_topk_ragged_indices
+                tk_ptr = rocm_metadata.c128a_decode_topk_ragged_indptr
+            self._rowlocal_sparse(
+                q[dlo - a : dhi - a],
+                o[dlo - a : dhi - a],
+                swa_metadata.decode_swa_ragged_indices,
+                swa_metadata.decode_swa_ragged_indptr[dlo : dhi + 1],
+                k_cache,
+                tk_idx,
+                tk_ptr[dlo : dhi + 1],
+            )
+            covered_hi = dhi
+        plo, phi = max(a, d), min(b, d + p)
+        if phi > plo:
+            assert swa_metadata.prefill_swa_ragged_indices is not None
+            assert swa_metadata.prefill_swa_ragged_indptr is not None
+            r0, r1 = plo - d, phi - d
+            tk_idx, tk_ptr = self._rowlocal_prefill_topk_window(
+                rocm_metadata, swa_metadata, k_cache, d, r0, r1
+            )
+            self._rowlocal_sparse(
+                q[plo - a : phi - a],
+                o[plo - a : phi - a],
+                swa_metadata.prefill_swa_ragged_indices,
+                swa_metadata.prefill_swa_ragged_indptr[r0 : r1 + 1],
+                k_cache,
+                tk_idx,
+                tk_ptr,
+            )
+            covered_lo = a if dhi > dlo else plo
+            covered_hi = phi
+        # Rows with no attention (past the scheduled tokens) stay zero.
+        for lo, hi in ((0, covered_lo - a), (covered_hi - a, b - a)):
+            if hi > lo:
+                o[lo:hi].zero_()
+
+    def _rowlocal_attn_out(
+        self,
+        q: torch.Tensor,
+        a: int,
+        b: int,
+        attn_metadata: dict[str, Any],
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sparse MLA on rows [a, b) and the output projection (row-local)."""
+        o = torch.empty_like(q)
+        self._rowlocal_mqa(q, o, a, b, attn_metadata)
+        return self._rowlocal_o_proj(o, positions[a:b])
+
+    def _rowlocal_o_proj(
+        self, o: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """_o_proj's fp8 wo_a route on all heads, then the full-K wo_b with no
+        reduce."""
+        from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+        from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
+
+        assert self._wo_a_cos_cache is not None
+        assert self._wo_a_sin_cache is not None
+        assert self._wo_b_full_scale is not None
+        o_fp8, o_scale = inverse_rope_group_quant(
+            o,
+            positions.to(torch.int64),
+            self._wo_a_cos_cache,
+            self._wo_a_sin_cache,
+            num_groups=self.n_groups,
+            quant_group_size=128,
+        )
+        zf = batched_gemm_a8w8_mxscale(
+            o_fp8,
+            self._wo_a_full_fp8_weight,
+            o_scale,
+            self._wo_a_full_e8m0_scale,
+            dtype=o.dtype,
+        ).flatten(1)
+        return self._bpre_attn_gemm(
+            self.wo_b_full.weight, self._wo_b_full_scale, zf, False
+        )
 
     def _prepare_and_attn(
         self,
@@ -1187,6 +1800,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # _fused_wqa_wkv_gemm and _o_proj both fall back to the standard linear path
         if on_gfx1250():
             return
+        # Before _prep shuffles wo_b and wo_b_full.
+        rowlocal_bytes = self._prepare_rowlocal_full() if self._rowlocal_full else 0
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
             get_fp8_block_weight_scale,
@@ -1222,8 +1837,45 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Refilled in place on reloads: captured CUDA graphs read them.
         refill_derived(self, "_wqa_wkv_scale", _prep(self.fused_wqa_wkv))
         refill_derived(self, "_wo_b_scale", _prep(self.wo_b))
+        if self._rowlocal_full:
+            refill_derived(self, "_wo_b_full_scale", _prep(self.wo_b_full))
         if _ON_GFX950 and envs.VLLM_ROCM_USE_AITER_FP8BMM:
             self._prepare_fp8_wo_a()
+            if self._rowlocal_full and self._wo_a_fp8_weight is not None:
+                self._prepare_rowlocal_fp8_wo_a()
+        self._rowlocal_added_bytes = rowlocal_bytes
+
+    def _prepare_rowlocal_fp8_wo_a(self) -> None:
+        """The full wo_a as n_groups fp8 groups, in the layout and E8M0 scale
+        encoding _prepare_fp8_wo_a gives the TP shard (whose groups are row
+        views of it)."""
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            get_fp8_block_weight_scale,
+        )
+
+        weight = self.wo_a_full.weight
+        scale = get_fp8_block_weight_scale(self.wo_a_full)
+        if scale is None:
+            scale = getattr(self.wo_a_full, "weight_scale", None)
+        if scale is None:
+            return
+        out_features, in_features = weight.shape
+        groups, per = self.n_groups, self.o_lora_rank
+        if out_features != groups * per or scale.shape != (
+            out_features // 128,
+            in_features // 128,
+        ):
+            return
+        e8m0 = _wo_a_block_scale_to_e8m0(scale)
+        if e8m0 is None:
+            return
+        self._wo_a_full_fp8_weight = weight.view(groups, per, in_features)
+        # Refilled in place on reloads, like the TP shard's.
+        refill_derived(
+            self,
+            "_wo_a_full_e8m0_scale",
+            e8m0.view(groups, per // 128, in_features // 128),
+        )
 
     def _prepare_fp8_wo_a(self) -> None:
         try:

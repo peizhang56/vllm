@@ -96,7 +96,10 @@ from vllm.models.deepseek_v4.amd.mega_moe import (
     finalize_mega_moe_weights,
 )
 from vllm.models.deepseek_v4.amd.mono_decode import MonoDecodeLayer
-from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
+from vllm.models.deepseek_v4.amd.rocm import (
+    ATTN_ROWLOCAL_LABEL,
+    DeepseekV4ROCMAiterMLAAttention,
+)
 from vllm.models.deepseek_v4.amd.seq_parallel_seam import (
     SEQ_PARALLEL_LABEL,
     SEQ_PARALLEL_MIN_ROWS,
@@ -1217,13 +1220,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp.gather(xs)
         if not fold:
             x = self.attn_norm(x)
+        # dsv4_rowlocal_attention: the attention returns this rank's rows of
+        # the full output, so there is nothing to reduce.
+        rowlocal = self.attn.rowlocal_ready()
         self.attn._sp_defer_reduce = True
+        if rowlocal:
+            self.attn._sp_rowlocal = sp
         try:
             a = self.attn(positions, x, None)
         finally:
             self.attn._sp_defer_reduce = False
+            self.attn._sp_rowlocal = None
             sp_fp8_handoff_clear()
-        x = sp.reduce_scatter(a)
+        x = a if rowlocal else sp.reduce_scatter(a)
 
         ffn_norm_weight = self.ffn_norm.weight if fold else None
         ffn_norm_eps = self.ffn_norm.variance_epsilon if fold else 0.0
@@ -1723,6 +1732,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(param_name)
+                    full_name = _rowlocal_full_name(param_name)
+                    if full_name is not None and full_name in params_dict:
+                        # dsv4_rowlocal_attention: the full (all-head) copy.
+                        full_param = params_dict[full_name]
+                        getattr(full_param, "weight_loader", default_weight_loader)(
+                            full_param, loaded_weight
+                        )
+                        loaded_params.add(full_name)
                     continue
 
         return loaded_params
@@ -1745,6 +1762,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             num_experts=num_experts,
             routed_experts_prefix="" if self.use_mega_moe else "routed_experts",
         )
+
+
+# dsv4_rowlocal_attention: backbone attention checkpoint tensors that also load
+# into the layer's full (all-head) copy.
+_ROWLOCAL_FULL_RE = re.compile(
+    r"(\.attn\.)(?:(wq_b|wo_a|wo_b)\.(weight|weight_scale_inv|weight_scale)"
+    r"|(attn_sink))$"
+)
+
+
+def _rowlocal_full_name(param_name: str) -> str | None:
+    """The full-copy parameter a backbone attention tensor also loads into."""
+    m = _ROWLOCAL_FULL_RE.search(param_name)
+    if m is None:
+        return None
+    if m.group(4) is not None:
+        return param_name[: m.start()] + m.group(1) + "attn_sink_full"
+    return param_name[: m.start()] + f"{m.group(1)}{m.group(2)}_full.{m.group(3)}"
 
 
 def _redirect_shared_expert_name(
@@ -1909,12 +1944,31 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         finalize_mega_moe_weights(self)
         # After per-layer quant finalize, so we preshuffle the final fp8 weights.
         fused_compressor_layers = 0
+        rowlocal_layers = 0
+        rowlocal_bytes = 0
         for module in self.modules():
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
                 fused_compressor_layers += module.prepare_compressor_gemm_fusion()
                 module.prepare_attn_preshuffle()
+                if module._rowlocal_full:
+                    rowlocal_layers += 1
+                    rowlocal_bytes += module._rowlocal_added_bytes
             elif isinstance(module, DeepseekV4MLP):
                 module.prepare_gateup_preshuffle()
+        if rowlocal_layers:
+            # The rebound wq_b / wo_a TP shards' storage is free now; return it
+            # before the KV cache is sized.
+            torch.accelerator.empty_cache()
+            logger.info(
+                "%s: rank %d holds full wq_b/wo_a/wo_b/attn_sink in %d backbone "
+                "attention layers (+%.2f GiB); wq_b/wo_a TP shards are "
+                "byte-identical row views, wo_b shard checked equal to the full "
+                "columns",
+                ATTN_ROWLOCAL_LABEL,
+                get_tensor_model_parallel_rank(),
+                rowlocal_layers,
+                rowlocal_bytes / 2**30,
+            )
         for module in self.modules():
             if isinstance(module, DeepseekV4DecoderLayer) and module.mono is not None:
                 module.mono.prepare(module)
